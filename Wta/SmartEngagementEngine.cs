@@ -126,7 +126,9 @@ namespace MDSFramework.Wta
 
                 if (site.Spec.Role == WeaponCascadeRole.FireControl ||
                     site.Spec.Role == WeaponCascadeRole.EarlyWarningRadar ||
-                    site.Spec.Role == WeaponCascadeRole.CommandControl)
+                    site.Spec.Role == WeaponCascadeRole.CommandControl ||
+                    site.Spec.Role == WeaponCascadeRole.LogisticsHauler ||
+                    site.Spec.IsContainerHauler)
                 {
                     continue;
                 }

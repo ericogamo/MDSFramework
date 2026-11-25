@@ -17,7 +17,8 @@ namespace MDSFramework.Api
         AbmVls = 5,
         EarlyWarningRadar = 6,
         CommandControl = 7,
-        AntiShipCoastal = 8
+        AntiShipCoastal = 8,
+        LogisticsHauler = 9
     }
 
     public enum SensorBand

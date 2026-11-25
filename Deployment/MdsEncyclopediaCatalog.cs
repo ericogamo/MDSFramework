@@ -436,8 +436,14 @@ namespace MDSFramework.Deployment
             clonedDef.spawnOffset = Vector3.zero;
             clonedDef.dontAutomaticallyAddToEncyclopedia = false;
 
-            if (!(clonedDef is VehicleDefinition) &&
-                string.Equals(spec.FallbackMeshArchetype, "container", StringComparison.OrdinalIgnoreCase))
+            if (clonedDef is VehicleDefinition && spec.IsContainerHauler)
+            {
+                clonedDef.length = 10.73f;
+                clonedDef.width = 2.98f;
+                clonedDef.height = 3.35f;
+            }
+            else if (!(clonedDef is VehicleDefinition) &&
+                     string.Equals(spec.FallbackMeshArchetype, "container", StringComparison.OrdinalIgnoreCase))
             {
                 clonedDef.length = Mathf.Max(1f, spec.ContainerLengthMeters);
                 clonedDef.width = Mathf.Max(1f, spec.ContainerWidthMeters);
@@ -588,12 +594,19 @@ namespace MDSFramework.Deployment
                 WeaponCascadeRole.LongRangeSam => "LRSAM",
                 WeaponCascadeRole.AbmVls => "VLS",
                 WeaponCascadeRole.AntiShipCoastal => "ASHM",
+                WeaponCascadeRole.LogisticsHauler => "HAUL",
                 _ => "MDS"
             };
         }
 
         private static string BuildUnitDescription(ContractorPackage pkg, ModularUnitSpec spec)
         {
+            if (spec.Role == WeaponCascadeRole.LogisticsHauler || spec.IsContainerHauler)
+            {
+                return $"{pkg.DisplayName} | 8x8 ISO Container Carrier / Flatbed Hauler | " +
+                       $"Unarmed Tactical Logistics | Faction: {pkg.DefaultFaction}";
+            }
+
             if (spec.Role == WeaponCascadeRole.CommandControl || spec.IsCommandCenter)
             {
                 return $"{pkg.DisplayName} | Skyshield.net C2 Hub | Relay {spec.NetworkRelayRadiusKm:0.#} km | " +

@@ -132,6 +132,9 @@ namespace MDSFramework.Api
         public bool LaunchAlongSocketForward { get; set; }
         public bool IsMobileVehicle { get; set; }
         public float WheelRadiusMeters { get; set; } = 0.67f;
+        public bool IsContainerHauler { get; set; }
+        public float CargoDeckHeightMeters { get; set; } = 0f;
+        public float CargoDeckOffsetZMeters { get; set; } = 0f;
         public float ContainerLengthMeters { get; set; } = 6.058f;
         public float ContainerWidthMeters { get; set; } = 2.438f;
         public float ContainerHeightMeters { get; set; } = 2.591f;

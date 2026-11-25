@@ -189,7 +189,9 @@ namespace MDSFramework.Deployment
 
             if (spec.Role == WeaponCascadeRole.FireControl ||
                 spec.Role == WeaponCascadeRole.EarlyWarningRadar ||
-                spec.Role == WeaponCascadeRole.CommandControl)
+                spec.Role == WeaponCascadeRole.CommandControl ||
+                spec.Role == WeaponCascadeRole.LogisticsHauler ||
+                spec.IsContainerHauler)
             {
                 return;
             }

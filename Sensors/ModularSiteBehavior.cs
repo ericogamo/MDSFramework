@@ -84,6 +84,7 @@ namespace MDSFramework.Sensors
             LocalHoldFire ||
             (Unit != null && RtsBridgeHost.QueryUnitHoldFire != null && RtsBridgeHost.QueryUnitHoldFire(Unit));
 
+        public bool IsLogisticsHauler => Spec != null && (Spec.Role == WeaponCascadeRole.LogisticsHauler || Spec.IsContainerHauler);
         public bool RequiresFcuLink => Spec != null && Spec.RequiresFcuLink;
         public bool HasActiveFcuLink => HasFireControlGuidance;
         public float FcuLinkRadiusKm => Spec != null ? Spec.FcuLinkRadiusKm : 18f;
@@ -91,7 +92,8 @@ namespace MDSFramework.Sensors
         public bool IsWeaponSite => Spec != null &&
             Spec.Role != WeaponCascadeRole.FireControl &&
             Spec.Role != WeaponCascadeRole.EarlyWarningRadar &&
-            Spec.Role != WeaponCascadeRole.CommandControl;
+            Spec.Role != WeaponCascadeRole.CommandControl &&
+            !IsLogisticsHauler;
 
         public bool IsInCommandNet { get; internal set; }
         public int CommandNetFcuCount { get; internal set; }
@@ -186,6 +188,7 @@ namespace MDSFramework.Sensors
         internal bool IsRadarCapable =>
             Spec != null &&
             !IsCommandCenter &&
+            !IsLogisticsHauler &&
             Spec.SensorProfile != null &&
             (Spec.SensorProfile.IsFireControlUnit ||
              Spec.Role == WeaponCascadeRole.EarlyWarningRadar ||
@@ -288,6 +291,27 @@ namespace MDSFramework.Sensors
                 building.OnRepair -= HandleBuildingRepaired;
                 building.OnRepair += HandleBuildingRepaired;
             }
+        }
+
+        public void SetHaulerOutriggersDeployed(bool deployed)
+        {
+            RequestDeployState(deployed);
+        }
+
+        public bool TryGetCargoDeckLocalOffset(out Vector3 localOffset)
+        {
+            if (!IsLogisticsHauler || Unit == null || Spec == null)
+            {
+                localOffset = Vector3.zero;
+                return false;
+            }
+
+            float targetBottomY = Rig?.RootObject != null
+                ? Rig.RootObject.transform.localPosition.y + Rig.Bounds.min.y
+                : -0.954f;
+            float deckHeight = Spec.CargoDeckHeightMeters > 0.1f ? Spec.CargoDeckHeightMeters : 1.715f;
+            localOffset = new Vector3(0f, targetBottomY + deckHeight, Spec.CargoDeckOffsetZMeters);
+            return true;
         }
 
         internal void RequestDeployState(bool deploy)
