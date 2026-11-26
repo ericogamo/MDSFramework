@@ -176,7 +176,7 @@ namespace MDSFramework.Patches
                 (missile.LosingGround() ||
                  missile.MissedTarget() ||
                  missile.speed < selfDestructSpeed ||
-                 (targetUnit == null && !custom.PassiveHojActive));
+                 (targetUnit == null && (!custom.PassiveHojActive || custom.HasExceededBlindCoastTime)));
 
             if (shouldSelfDestruct && missile.rb != null)
             {

@@ -137,7 +137,9 @@ namespace MDSFramework.Deployment
 
         internal static bool ShouldStartDeployed(ModularUnitSpec spec)
         {
-            if (spec.IsMobileVehicle || spec.Role == WeaponCascadeRole.AntiShipCoastal)
+            if (spec.IsMobileVehicle ||
+                spec.Role == WeaponCascadeRole.AntiShipCoastal ||
+                spec.Role == WeaponCascadeRole.AntiVehicleDrone)
             {
                 return false;
             }

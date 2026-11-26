@@ -125,6 +125,7 @@ namespace MDSFramework.Api
         public int DestructionDebrisCount { get; set; } = 6;
         public float LaserPowerFactor { get; set; } = 1.0f;
         public bool VerticalLaunch { get; set; }
+        public bool CanEngageGroundVehicles { get; set; }
         public bool SpinRadarDish { get; set; }
         public float RadarSpinDegPerSec { get; set; } = 90f;
         public float FcuLinkRadiusKm { get; set; } = 15f;
@@ -216,6 +217,9 @@ namespace MDSFramework.Api
         public float RearmCostPerRound { get; set; } = 4f;
         public string IconRelativePath { get; set; } = string.Empty;
         public bool IsAntiShip { get; set; }
+        public bool IsAntiVehicle { get; set; }
+        public float LoiterCruiseAltitudeMeters { get; set; } = 220f;
+        public float TopAttackDiveRangeMeters { get; set; } = 850f;
         public float TargetMach { get; set; } = 0f;
         public float StealthRcsOverride { get; set; } = 0f;
         public float SeekerEccmJamTolerance { get; set; } = 0.55f;
@@ -232,6 +236,15 @@ namespace MDSFramework.Api
         public string[] AircraftMountCloneKeys { get; set; } = Array.Empty<string>();
         public float AircraftMountMassKg { get; set; } = 416f;
         public string AircraftMountShortName { get; set; } = string.Empty;
+        public bool RequiresTargetEcmToTrack { get; set; }
+        public string WarningAlarmAudioRelativePath { get; set; } = string.Empty;
+        public string WarningAlertAudioRelativePath { get; set; } = string.Empty;
+        public float WarningAlarmVolume { get; set; } = 0.85f;
+        public float WarningDetectionRangeMeters { get; set; } = 0f;
+        public string MotorLoopAudioRelativePath { get; set; } = string.Empty;
+        public float MotorLoopAudioVolume { get; set; } = 0.85f;
+        public float MotorLoopAudioMinDistance { get; set; } = 22f;
+        public float MotorLoopAudioMaxDistance { get; set; } = 1600f;
     }
 
     public sealed class DeploymentLogisticsSpec

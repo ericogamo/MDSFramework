@@ -85,6 +85,9 @@ namespace MDSFramework.Missiles
         private Vector3 lastKnownHojVel;
         private float lastKnownHojTime;
         private bool hasLastKnownHoj;
+        private float ecmLostTime = -1f;
+        private Vector3 blindFlightDir = Vector3.forward;
+        private bool blindFlightDirInitialized;
 
         // Pre-calculated 3D terrain-avoidance route & evasive guidance state
         private readonly List<Vector3> precomputedRoutePoints = new List<Vector3>(256);
@@ -108,6 +111,9 @@ namespace MDSFramework.Missiles
         private AudioSource? cachedStartupAudio;
         private float cachedStartupAudioVol = 1f;
         private bool startupAudioMuted;
+        private AudioSource? customMotorAudioSource;
+        private float customMotorBasePitch = 1f;
+        private float lastVanillaAudioMuteCheck = -1f;
 
         private readonly struct AaThreatBubble
         {
@@ -147,6 +153,12 @@ namespace MDSFramework.Missiles
         internal float ThermalHardening => Spec != null ? Mathf.Max(0.25f, Spec.ThermalHardening) : 1.0f;
         internal bool IsDecoy => Spec != null && (Spec.IsDecoy || Spec.FlightProfile == MissileFlightProfile.Decoy);
         internal bool IsTargetActivelyJamming { get; private set; }
+        internal bool HasExceededBlindCoastTime =>
+            Spec != null &&
+            Spec.RequiresTargetEcmToTrack &&
+            !IsTargetActivelyJamming &&
+            ecmLostTime > 0f &&
+            (Time.time - ecmLostTime) > 12f;
 
         internal void Initialize(
             ContractorPackage package,
@@ -163,13 +175,15 @@ namespace MDSFramework.Missiles
             Missile = missile;
             TargetUnit = targetUnit;
             OwnerFaction = ownerFaction;
-            PassiveHojActive = startPassiveHoj && spec.SupportsActiveToPassiveHoj;
+            PassiveHojActive = spec.RequiresTargetEcmToTrack || (startPassiveHoj && spec.SupportsActiveToPassiveHoj);
             launchedVertically = verticalLaunch;
             Vector3 fwd = missile.transform.forward;
             initialLaunchDir = fwd.sqrMagnitude > 0.01f ? fwd.normalized : Vector3.up;
             maxFlightLifetimeSeconds = spec.IsAntiShip
                 ? Mathf.Clamp(Mathf.Max(110f, spec.MaxEngagementRangeKm * 5.6f), 110f, 380f)
-                : Mathf.Clamp(Mathf.Max(25f, spec.MaxEngagementRangeKm * 2.0f), 25f, 150f);
+                : spec.IsAntiVehicle
+                    ? Mathf.Clamp(Mathf.Max(120f, spec.MaxEngagementRangeKm * 15.0f), 120f, 360f)
+                    : Mathf.Clamp(Mathf.Max(25f, spec.MaxEngagementRangeKm * 2.0f), 25f, 150f);
             weaveSeed = (missile.persistentID.Id % 17) * 0.43f;
             if (PassiveHojActive && targetUnit != null && !targetUnit.disabled)
             {
@@ -194,6 +208,7 @@ namespace MDSFramework.Missiles
             ConfigureSeeker();
             ExtendMotorForSpecRange();
             AttachCustomVisualRig();
+            AttachCustomMotorAudio();
 
             if (isAirDropped &&
                 spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive)
@@ -219,7 +234,8 @@ namespace MDSFramework.Missiles
                     }
                 }
             }
-            else if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
+            else if ((spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive ||
+                      spec.FlightProfile == MissileFlightProfile.LoiteringTopAttack) &&
                 !missile.remoteSim &&
                 targetUnit != null &&
                 !targetUnit.disabled)
@@ -252,6 +268,7 @@ namespace MDSFramework.Missiles
             if (MdsConfig.EnableAbmEarlyWarning.Value &&
                 !spec.IsAbmInterceptor &&
                 !spec.IsAntiShip &&
+                !spec.IsAntiVehicle &&
                 spec.BlastYield > MdsConfig.AbmBlastYieldThreshold.Value)
             {
                 bool hasBallisticProfile = spec.FlightProfile == MissileFlightProfile.Ballistic ||
@@ -270,6 +287,7 @@ namespace MDSFramework.Missiles
             Spec = spec;
             Missile = missile;
             AttachCustomVisualRig();
+            AttachCustomMotorAudio();
 
             if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
                 ((missile.ownerID.IsValid && missile.ownerID.TryGetUnit(out Unit ownerUnit) && ownerUnit is Aircraft) ||
@@ -348,6 +366,13 @@ namespace MDSFramework.Missiles
                     GameInteropHelpers.OpticalCruiseFinDelayField?.SetValue(optical, Spec.FinDeployDelaySeconds);
                     GameInteropHelpers.OpticalCruiseGuidanceDelayField?.SetValue(optical, 0.35f);
                 }
+                else if (Spec.IsAntiVehicle)
+                {
+                    GameInteropHelpers.OpticalCruiseAltTargetField?.SetValue(optical, Mathf.Max(80f, Spec.LoiterCruiseAltitudeMeters));
+                    GameInteropHelpers.OpticalCruiseTermRangeField?.SetValue(optical, Mathf.Max(400f, Spec.TopAttackDiveRangeMeters));
+                    GameInteropHelpers.OpticalCruiseFinDelayField?.SetValue(optical, Spec.FinDeployDelaySeconds);
+                    GameInteropHelpers.OpticalCruiseGuidanceDelayField?.SetValue(optical, 0.35f);
+                }
 
                 if (TargetUnit != null && !TargetUnit.disabled)
                 {
@@ -375,10 +400,10 @@ namespace MDSFramework.Missiles
 
             if (Spec.TargetMach > 0f)
             {
-                return Mathf.Max(310f, Spec.TargetMach * 340.3f * 1.06f);
+                return Mathf.Max(Spec.IsAntiVehicle ? 90f : 310f, Spec.TargetMach * 340.3f * 1.06f);
             }
 
-            return Spec.CruiseSpeedMps > 0f ? Mathf.Max(400f, Spec.CruiseSpeedMps) : 0f;
+            return Spec.CruiseSpeedMps > 0f ? Mathf.Max(Spec.IsAntiVehicle ? 80f : 400f, Spec.CruiseSpeedMps) : 0f;
         }
 
         private void ExtendMotorForSpecRange()
@@ -415,7 +440,9 @@ namespace MDSFramework.Missiles
 
             float desiredBurn = Spec.IsAntiShip
                 ? Mathf.Clamp(Spec.MaxEngagementRangeKm * 4.8f, 60f, 320f)
-                : Mathf.Clamp(Spec.MaxEngagementRangeKm * 0.35f, 8f, 30f);
+                : Spec.IsAntiVehicle
+                    ? Mathf.Clamp(Spec.MaxEngagementRangeKm * 13.5f, 60f, 320f)
+                    : Mathf.Clamp(Spec.MaxEngagementRangeKm * 0.30f, 8f, 30f);
             float scale = totalBurn > 0.1f && totalBurn < desiredBurn ? desiredBurn / totalBurn : 1f;
             float maxSpeedCap = GetEffectiveMaxSpeedMps();
 
@@ -484,6 +511,124 @@ namespace MDSFramework.Missiles
                 animator = rig.RootObject.AddComponent<GlbKeyframedAnimator>();
                 animator.Initialize(rig, desiredDurationSeconds: 0.75f, startDeployed: !Spec.EnableFoldingFins);
                 finsDeployed = !Spec.EnableFoldingFins;
+            }
+        }
+
+        private void AttachCustomMotorAudio()
+        {
+            if (Missile == null || Package == null || Spec == null ||
+                string.IsNullOrWhiteSpace(Spec.MotorLoopAudioRelativePath))
+            {
+                return;
+            }
+
+            string? audioPath = ResolveAssetPath(Package, Spec.MotorLoopAudioRelativePath, Array.Empty<string>());
+            if (string.IsNullOrEmpty(audioPath))
+            {
+                return;
+            }
+
+            AudioClip? clip = WavAudioClipLoader.LoadOrGet(audioPath);
+            if (clip == null)
+            {
+                return;
+            }
+
+            MuteVanillaMissileAudio();
+
+            var audioGo = new GameObject("MdsCustomMotorAudio");
+            audioGo.transform.SetParent(Missile.transform, false);
+            audioGo.transform.localPosition = Vector3.zero;
+
+            AudioSource src = audioGo.AddComponent<AudioSource>();
+            src.clip = clip;
+            src.loop = true;
+            src.playOnAwake = false;
+            src.spatialBlend = 1.0f;
+            src.dopplerLevel = 1.35f;
+            src.rolloffMode = AudioRolloffMode.Logarithmic;
+            src.minDistance = Mathf.Max(5f, Spec.MotorLoopAudioMinDistance);
+            src.maxDistance = Mathf.Max(150f, Spec.MotorLoopAudioMaxDistance);
+            src.volume = Mathf.Clamp(Spec.MotorLoopAudioVolume, 0f, 1.5f) * 0.55f;
+
+            uint id = Missile.persistentID.IsValid ? Missile.persistentID.Id : (uint)Missile.GetInstanceID();
+            customMotorBasePitch = 0.93f + ((id % 7) * 0.025f);
+            src.pitch = customMotorBasePitch;
+            if (clip.length > 0.1f)
+            {
+                src.time = ((id % 11) * 0.19f) % clip.length;
+            }
+
+            customMotorAudioSource = src;
+            src.Play();
+        }
+
+        private void MuteVanillaMissileAudio()
+        {
+            if (Missile == null)
+            {
+                return;
+            }
+
+            AudioSource[] sources = Missile.GetComponentsInChildren<AudioSource>(true);
+            for (int i = 0; i < sources.Length; i++)
+            {
+                AudioSource s = sources[i];
+                if (s == null || ReferenceEquals(s, customMotorAudioSource))
+                {
+                    continue;
+                }
+
+                s.mute = true;
+                s.volume = 0f;
+                if (s.isPlaying)
+                {
+                    s.Stop();
+                }
+            }
+        }
+
+        private void UpdateCustomMotorAudio(float dt)
+        {
+            if (customMotorAudioSource == null || Missile == null || Missile.disabled)
+            {
+                return;
+            }
+
+            if (ageSeconds <= 2.2f && ageSeconds - lastVanillaAudioMuteCheck >= 0.25f)
+            {
+                lastVanillaAudioMuteCheck = ageSeconds;
+                MuteVanillaMissileAudio();
+            }
+
+            if (!customMotorAudioSource.isPlaying && customMotorAudioSource.clip != null)
+            {
+                customMotorAudioSource.Play();
+            }
+
+            float spd = Missile.rb != null ? Missile.rb.velocity.magnitude : Mathf.Max(80f, Spec.CruiseSpeedMps);
+            float speedNorm = Mathf.Clamp01((spd - 60f) / 130f);
+            float diveFactor = Mathf.Clamp01(-Missile.transform.forward.y);
+            float targetPitch = customMotorBasePitch * (0.86f + (speedNorm * 0.34f) + (diveFactor * 0.38f));
+            customMotorAudioSource.pitch = Mathf.Lerp(
+                customMotorAudioSource.pitch,
+                Mathf.Clamp(targetPitch, 0.7f, 1.85f),
+                1f - Mathf.Exp(-Mathf.Max(0.005f, dt) * 8f));
+
+            float baseVol = Mathf.Clamp(Spec.MotorLoopAudioVolume, 0f, 1.5f);
+            float ramp = ageSeconds < 0.35f ? Mathf.Lerp(0.55f, 1.0f, ageSeconds / 0.35f) : (1.0f + (diveFactor * 0.15f));
+            customMotorAudioSource.volume = Mathf.Lerp(
+                customMotorAudioSource.volume,
+                baseVol * ramp,
+                1f - Mathf.Exp(-Mathf.Max(0.005f, dt) * 6f));
+        }
+
+        private void StopCustomMotorAudio()
+        {
+            if (customMotorAudioSource != null)
+            {
+                customMotorAudioSource.Stop();
+                customMotorAudioSource.mute = true;
             }
         }
 
@@ -562,6 +707,7 @@ namespace MDSFramework.Missiles
                     }
                 }
 
+                UpdateCustomMotorAudio(dt);
                 UpdateFlightControlSurfaceAnimation(dt);
                 return;
             }
@@ -583,7 +729,9 @@ namespace MDSFramework.Missiles
             {
                 float climbDuration = Spec.IsAntiShip
                     ? (Spec.BoosterDropSeconds > 0f ? 1.55f : 0.95f)
-                    : (launchedVertically ? 0.80f : 0.45f);
+                    : Spec.IsAntiVehicle
+                        ? 0.85f
+                        : (launchedVertically ? 0.80f : 0.45f);
                 if (!airDropMotorIgnited && ageSeconds < climbDuration)
                 {
                     Missile.SetAimpoint(
@@ -599,6 +747,7 @@ namespace MDSFramework.Missiles
             }
 
             EnforceSpeedLimit(dt);
+            UpdateCustomMotorAudio(dt);
             UpdateFlightControlSurfaceAnimation(dt);
 
             if (Spec.IsAbmInterceptor)
@@ -851,7 +1000,7 @@ namespace MDSFramework.Missiles
                 return;
             }
 
-            if (!Spec.IsAntiShip && Spec.MaxMach > 0f)
+            if (!Spec.IsAntiShip && !Spec.IsAntiVehicle && Spec.MaxMach > 0f)
             {
                 float altMeters = Mathf.Max(0f, Missile.transform.position.y - Datum.LocalSeaY);
                 float speedOfSound = Mathf.Max(290f, LevelInfo.GetSpeedOfSound(altMeters));
@@ -861,7 +1010,7 @@ namespace MDSFramework.Missiles
             Vector3 vel = Missile.rb.velocity;
             float speed = vel.magnitude;
 
-            if (!Spec.IsAntiShip && Missile.EngineOn())
+            if (!Spec.IsAntiShip && !Spec.IsAntiVehicle && Missile.EngineOn())
             {
                 float throttle = speed >= effectiveCap * 0.98f
                     ? 0.05f
@@ -903,6 +1052,12 @@ namespace MDSFramework.Missiles
                 return true;
             }
 
+            if (Spec.RequiresTargetEcmToTrack && !IsTargetActivelyJamming)
+            {
+                return !HasExceededBlindCoastTime && Missile.speed >= 85f;
+            }
+
+            float minAliveSpeed = Spec.IsAntiVehicle ? 45f : 85f;
             if (TargetUnit != null && !TargetUnit.disabled)
             {
                 if (Vector3.Distance(Missile.transform.position, TargetUnit.transform.position) <= 220f)
@@ -910,7 +1065,7 @@ namespace MDSFramework.Missiles
                     return false;
                 }
 
-                if (ageSeconds < 10.0f || Missile.EngineOn() || Missile.speed >= 85f)
+                if (ageSeconds < 10.0f || Missile.EngineOn() || Missile.speed >= minAliveSpeed)
                 {
                     return true;
                 }
@@ -922,7 +1077,7 @@ namespace MDSFramework.Missiles
                     return false;
                 }
 
-                if (ageSeconds < 10.0f || Missile.EngineOn() || Missile.speed >= 85f)
+                if (ageSeconds < 10.0f || Missile.EngineOn() || Missile.speed >= minAliveSpeed)
                 {
                     return true;
                 }
@@ -933,7 +1088,7 @@ namespace MDSFramework.Missiles
 
         private void UpdateActiveTargetDatalink()
         {
-            if (PassiveHojActive || TargetUnit == null || TargetUnit.disabled || GameInteropHelpers.IsAircraftSplashed(TargetUnit))
+            if (PassiveHojActive || Spec.RequiresTargetEcmToTrack || TargetUnit == null || TargetUnit.disabled || GameInteropHelpers.IsAircraftSplashed(TargetUnit))
             {
                 return;
             }
@@ -960,7 +1115,7 @@ namespace MDSFramework.Missiles
                     GameInteropHelpers.ArhKnownVelField?.SetValue(arh, vel);
                 }
             }
-            else if (Spec.IsAntiShip && GameInteropHelpers.SafeGetSeeker(Missile) is MissileSeeker seeker)
+            else if ((Spec.IsAntiShip || Spec.IsAntiVehicle) && GameInteropHelpers.SafeGetSeeker(Missile) is MissileSeeker seeker)
             {
                 if (GameInteropHelpers.SeekerTargetUnitField?.GetValue(seeker) is not Unit currentSeekerTarget || currentSeekerTarget.disabled)
                 {
@@ -971,6 +1126,11 @@ namespace MDSFramework.Missiles
 
         private void UpdateTargetReference()
         {
+            if (Spec.RequiresTargetEcmToTrack && !IsTargetActivelyJamming)
+            {
+                return;
+            }
+
             if (Spec.IsAntiShip && TargetUnit != null && TargetUnit is not Ship)
             {
                 TargetUnit = null;
@@ -994,6 +1154,12 @@ namespace MDSFramework.Missiles
 
         private void UpdateActivePassiveHoj(float dt)
         {
+            if (Spec.RequiresTargetEcmToTrack)
+            {
+                UpdateStrictEcmOnlyHoj();
+                return;
+            }
+
             if (!Spec.SupportsActiveToPassiveHoj)
             {
                 return;
@@ -1197,8 +1363,246 @@ namespace MDSFramework.Missiles
             }
         }
 
+        private bool IsLiveHostileEcmEmitter(Unit? u)
+        {
+            if (u == null || u.disabled || GameInteropHelpers.IsAircraftSplashed(u))
+            {
+                return false;
+            }
+
+            if (Spec.IsAntiShip && u is not Ship)
+            {
+                return false;
+            }
+
+            if (!GameInteropHelpers.IsHostileToAffinity(u, OwnerFaction, Missile.NetworkHQ ?? Missile.MapHQ))
+            {
+                return false;
+            }
+
+            if (u is Aircraft ac && ac.GetECMIntensity() > 0.05f)
+            {
+                return true;
+            }
+
+            return SensorNetworkManager.Instance != null &&
+                   SensorNetworkManager.Instance.HasFreshDirectJamEvent(u, 0.65f);
+        }
+
+        private bool TryGetFriendlyHojTrack(Unit target, out HojTrackEntry matched)
+        {
+            if (SensorNetworkManager.Instance != null)
+            {
+                IReadOnlyList<HojTrackEntry> tracks = SensorNetworkManager.Instance.ActiveHojTracks;
+                for (int i = 0; i < tracks.Count; i++)
+                {
+                    HojTrackEntry tr = tracks[i];
+                    if (tr.Faction == OwnerFaction && ReferenceEquals(tr.JammerUnit, target))
+                    {
+                        matched = tr;
+                        return true;
+                    }
+                }
+            }
+
+            matched = default;
+            return false;
+        }
+
+        private void UpdateStrictEcmOnlyHoj()
+        {
+            PassiveHojActive = true;
+            if (Missile.seekerMode != Missile.SeekerMode.passive)
+            {
+                Missile.NetworkseekerMode = Missile.SeekerMode.passive;
+            }
+
+            Vector3 myPos = Missile.transform.position;
+            Vector3 myFwd = Missile.transform.forward;
+            float maxRange = Mathf.Max(15000f, Spec.MaxEngagementRangeKm * 1200f);
+            float maxRangeSq = maxRange * maxRange;
+            const float onboardPassiveRfRangeSq = 15000f * 15000f;
+
+            bool jammerDetected = false;
+            Unit? foundUnit = null;
+            Vector3 jammerPos = Vector3.zero;
+            Vector3 jammerVel = Vector3.zero;
+
+            if (IsLiveHostileEcmEmitter(TargetUnit))
+            {
+                Vector3 toTarget = TargetUnit!.transform.position - myPos;
+                float distSq = toTarget.sqrMagnitude;
+                if (distSq <= maxRangeSq &&
+                    (ageSeconds < 2.5f || Vector3.Angle(myFwd, toTarget) <= 115f))
+                {
+                    bool hasHojTrack = TryGetFriendlyHojTrack(TargetUnit, out HojTrackEntry track);
+                    bool directLos = !Physics.Linecast(myPos, TargetUnit.transform.position, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore);
+                    if (directLos || (distSq > onboardPassiveRfRangeSq && hasHojTrack))
+                    {
+                        jammerDetected = true;
+                        foundUnit = TargetUnit;
+                        bool useOnboardPos = directLos && (distSq <= onboardPassiveRfRangeSq || !hasHojTrack);
+                        jammerPos = useOnboardPos ? TargetUnit.transform.position : track.TriangulatedWorldPos;
+                        jammerVel = useOnboardPos
+                            ? (TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero)
+                            : track.Velocity;
+                    }
+                }
+            }
+
+            if (!jammerDetected)
+            {
+                float bestDistSq = float.MaxValue;
+
+                if (SensorNetworkManager.Instance != null)
+                {
+                    IReadOnlyList<HojTrackEntry> tracks = SensorNetworkManager.Instance.ActiveHojTracks;
+                    for (int i = 0; i < tracks.Count; i++)
+                    {
+                        HojTrackEntry tr = tracks[i];
+                        if (tr.Faction != OwnerFaction || !IsLiveHostileEcmEmitter(tr.JammerUnit))
+                        {
+                            continue;
+                        }
+
+                        Unit cand = tr.JammerUnit!;
+                        Vector3 toCand = cand.transform.position - myPos;
+                        float distSq = toCand.sqrMagnitude;
+                        if (distSq > maxRangeSq || distSq >= bestDistSq || Vector3.Angle(myFwd, toCand) > 65f)
+                        {
+                            continue;
+                        }
+
+                        bool directLos = !Physics.Linecast(myPos, cand.transform.position, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore);
+                        if (!directLos && distSq <= onboardPassiveRfRangeSq)
+                        {
+                            continue;
+                        }
+
+                        bestDistSq = distSq;
+                        jammerDetected = true;
+                        foundUnit = cand;
+                        bool onboardPassive = directLos && distSq <= onboardPassiveRfRangeSq;
+                        jammerPos = onboardPassive ? cand.transform.position : tr.TriangulatedWorldPos;
+                        jammerVel = onboardPassive
+                            ? (cand.rb != null ? cand.rb.velocity : Vector3.zero)
+                            : tr.Velocity;
+                    }
+                }
+
+                List<Unit>? allUnits = UnitRegistry.allUnits;
+                if (allUnits != null)
+                {
+                    for (int i = 0; i < allUnits.Count; i++)
+                    {
+                        if (allUnits[i] is not Aircraft ac || !IsLiveHostileEcmEmitter(ac))
+                        {
+                            continue;
+                        }
+
+                        Vector3 toCand = ac.transform.position - myPos;
+                        float distSq = toCand.sqrMagnitude;
+                        if (distSq > maxRangeSq || distSq >= bestDistSq || Vector3.Angle(myFwd, toCand) > 65f)
+                        {
+                            continue;
+                        }
+
+                        if (Physics.Linecast(myPos, ac.transform.position, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+                        {
+                            continue;
+                        }
+
+                        bestDistSq = distSq;
+                        jammerDetected = true;
+                        foundUnit = ac;
+                        jammerPos = ac.transform.position;
+                        jammerVel = ac.rb != null ? ac.rb.velocity : Vector3.zero;
+                    }
+                }
+            }
+
+            if (jammerDetected && foundUnit != null)
+            {
+                ecmLostTime = -1f;
+                blindFlightDirInitialized = false;
+                IsTargetActivelyJamming = true;
+                lastKnownHojPos = jammerPos;
+                lastKnownHojVel = jammerVel;
+                lastKnownHojTime = Time.time;
+                hasLastKnownHoj = true;
+
+                if (!ReferenceEquals(TargetUnit, foundUnit) || Missile.targetID != foundUnit.persistentID)
+                {
+                    TargetUnit = foundUnit;
+                    Missile.SetTarget(foundUnit);
+                    Transform? part = foundUnit.GetRandomPart();
+                    if (part != null && foundUnit.rb != null)
+                    {
+                        Missile.SetProxyFuse(part, foundUnit.rb);
+                    }
+                }
+
+                if (GameInteropHelpers.SafeGetSeeker(Missile) is ARHSeeker arhSeeker)
+                {
+                    GameInteropHelpers.SeekerTargetUnitField?.SetValue(arhSeeker, foundUnit);
+                    GameInteropHelpers.ArhKnownPosField?.SetValue(arhSeeker, GameInteropHelpers.WorldToGlobal(jammerPos));
+                    GameInteropHelpers.ArhKnownVelField?.SetValue(arhSeeker, jammerVel);
+                    GameInteropHelpers.ArhRadarLockField?.SetValue(arhSeeker, false);
+                    hojUpdatedAimThisTick = true;
+                }
+                else if (Time.time - lastHojAimUpdate >= 0.25f)
+                {
+                    lastHojAimUpdate = Time.time;
+                    Missile.SetAimpoint(GameInteropHelpers.WorldToGlobal(jammerPos), jammerVel);
+                    hojUpdatedAimThisTick = true;
+                }
+            }
+            else
+            {
+                IsTargetActivelyJamming = false;
+                TargetUnit = null;
+                if (Missile.targetID.IsValid)
+                {
+                    Missile.SetTarget(null);
+                    MdsLog.Debug($"[HOJ] '{Spec.MissileId}' lost ECM emission — breaking lock and flying blind.");
+                }
+
+                Missile.SetProxyFuse(null, null);
+
+                if (!blindFlightDirInitialized)
+                {
+                    ecmLostTime = Time.time;
+                    Vector3 baseDir = (Missile.rb != null && Missile.rb.velocity.sqrMagnitude > 25f)
+                        ? Missile.rb.velocity.normalized
+                        : Missile.transform.forward;
+                    blindFlightDir = (Quaternion.Euler(
+                        UnityEngine.Random.Range(-4f, 4f),
+                        UnityEngine.Random.Range(-6f, 6f),
+                        0f) * baseDir).normalized;
+                    blindFlightDirInitialized = true;
+                }
+
+                GlobalPosition blindAim = GameInteropHelpers.WorldToGlobal(myPos + (blindFlightDir * 25000f));
+                if (GameInteropHelpers.SafeGetSeeker(Missile) is ARHSeeker arhBlind)
+                {
+                    GameInteropHelpers.SeekerTargetUnitField?.SetValue(arhBlind, null);
+                    GameInteropHelpers.ArhRadarLockField?.SetValue(arhBlind, false);
+                    GameInteropHelpers.ArhKnownPosField?.SetValue(arhBlind, blindAim);
+                    GameInteropHelpers.ArhKnownVelField?.SetValue(arhBlind, Vector3.zero);
+                }
+
+                Missile.SetAimpoint(blindAim, Vector3.zero);
+                hojUpdatedAimThisTick = true;
+            }
+        }
+
         private void UpdateFlightProfileGuidance(float dt)
         {
+            if (Spec.RequiresTargetEcmToTrack && !IsTargetActivelyJamming)
+            {
+                return;
+            }
+
             if (TargetUnit == null || TargetUnit.disabled || Missile.rb == null)
             {
                 return;
@@ -1252,6 +1656,10 @@ namespace MDSFramework.Missiles
                     UpdateSeaSkimmingEvasiveProfile(myPos, targetPos, targetVel, dist, tti, dt, ref aimPoint);
                     break;
 
+                case MissileFlightProfile.LoiteringTopAttack:
+                    UpdateLoiteringTopAttackProfile(myPos, targetPos, targetVel, dist, dt, ref aimPoint);
+                    break;
+
                 case MissileFlightProfile.Ballistic:
                     if (Spec.IsAbmInterceptor)
                     {
@@ -1293,7 +1701,12 @@ namespace MDSFramework.Missiles
                 Missile.SetAimpoint(GameInteropHelpers.WorldToGlobal(aimPoint), targetVel);
             }
 
-            if (!hojUpdatedAimThisTick && Spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
+            if (!hojUpdatedAimThisTick && Spec.FlightProfile == MissileFlightProfile.LoiteringTopAttack &&
+                ageSeconds > 0.85f)
+            {
+                SteerLoiteringTopAttackDrone(myPos, targetPos, targetVel, dist, aimPoint, dt);
+            }
+            else if (!hojUpdatedAimThisTick && Spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
                 ageSeconds > (Spec.BoosterDropSeconds > 0f ? 1.55f : 0.95f))
             {
                 Vector3 desiredDir = (aimPoint - myPos).normalized;
@@ -1360,6 +1773,252 @@ namespace MDSFramework.Missiles
             }
         }
 
+        private Vector3 AdvanceRouteLookahead(
+            Vector3 myPos,
+            Vector3 fallbackPos,
+            float lookaheadMeters,
+            float minFloorY,
+            out bool anyOverLand)
+        {
+            anyOverLand = false;
+            int ptCount = precomputedRoutePoints.Count;
+            if (ptCount < 2)
+            {
+                return fallbackPos;
+            }
+
+            int searchEnd = Mathf.Min(ptCount - 1, routeCursorIndex + 16);
+            int bestIdx = routeCursorIndex;
+            float bestSq = float.MaxValue;
+            for (int i = routeCursorIndex; i <= searchEnd; i++)
+            {
+                Vector3 p = precomputedRoutePoints[i];
+                float dx = p.x - myPos.x;
+                float dz = p.z - myPos.z;
+                float dSq = (dx * dx) + (dz * dz);
+                if (dSq < bestSq)
+                {
+                    bestSq = dSq;
+                    bestIdx = i;
+                }
+            }
+
+            routeCursorIndex = bestIdx;
+
+            Vector3 prevPt = precomputedRoutePoints[routeCursorIndex];
+            float maxChordSafeY = Mathf.Max(minFloorY, prevPt.y);
+            anyOverLand |= precomputedRouteOverLand[routeCursorIndex];
+
+            float accumulated = 0f;
+            int idx = routeCursorIndex;
+            Vector3 chosenPt = prevPt;
+            while (idx + 1 < ptCount)
+            {
+                Vector3 nextPt = precomputedRoutePoints[idx + 1];
+                float segLen = Vector2.Distance(new Vector2(prevPt.x, prevPt.z), new Vector2(nextPt.x, nextPt.z));
+                maxChordSafeY = Mathf.Max(maxChordSafeY, nextPt.y);
+                anyOverLand |= precomputedRouteOverLand[idx + 1];
+
+                if (accumulated + segLen >= lookaheadMeters && segLen > 0.1f)
+                {
+                    float t = Mathf.Clamp01((lookaheadMeters - accumulated) / segLen);
+                    chosenPt = Vector3.Lerp(prevPt, nextPt, t);
+                    break;
+                }
+
+                accumulated += segLen;
+                prevPt = nextPt;
+                chosenPt = nextPt;
+                idx++;
+            }
+
+            chosenPt.y = Mathf.Max(chosenPt.y, maxChordSafeY);
+            return chosenPt;
+        }
+
+        private void EnsureDynamicRouteUpdated(Vector3 myPos, Vector3 targetPos, float dist, float targetMoveThreshold)
+        {
+            bool needsTargetMovedRecompute =
+                Time.time - lastRouteRecomputeTime >= 3.5f &&
+                dist > 1200f &&
+                Vector3.SqrMagnitude(targetPos - routeTargetAnchorPos) > targetMoveThreshold * targetMoveThreshold;
+
+            bool needsLiveAaRecompute = false;
+            if (Time.time >= nextLiveAaCheckTime)
+            {
+                nextLiveAaCheckTime = Time.time + 1.5f;
+                if (dist > 1400f &&
+                    Time.time - lastRouteRecomputeTime >= 3.5f &&
+                    routePrecomputed &&
+                    precomputedRoutePoints.Count >= 2)
+                {
+                    needsLiveAaRecompute = IsUpcomingRouteEnteringNewAaThreat(targetPos);
+                }
+            }
+
+            if (!routePrecomputed ||
+                precomputedRoutePoints.Count < 2 ||
+                needsTargetMovedRecompute ||
+                needsLiveAaRecompute)
+            {
+                PrecomputeSeaWraithRoute(myPos, targetPos);
+            }
+        }
+
+        private void UpdateLoiteringTopAttackProfile(
+            Vector3 myPos,
+            Vector3 targetPos,
+            Vector3 targetVel,
+            float dist,
+            float dt,
+            ref Vector3 aimPoint)
+        {
+            _ = dt;
+            emergencyPullUpThisTick = false;
+            float seaY = Datum.LocalSeaY;
+            float cruiseSpeed = Mathf.Max(85f, Spec.CruiseSpeedMps > 0f ? Spec.CruiseSpeedMps : 135f);
+            float tti = Mathf.Clamp(dist / cruiseSpeed, 0.05f, 8.0f);
+            Vector3 predictedTarget = targetPos + (targetVel * (tti * 0.82f));
+            Vector3 flatDelta = new Vector3(predictedTarget.x - myPos.x, 0f, predictedTarget.z - myPos.z);
+            float horizDist = flatDelta.magnitude;
+            float diveRange = Mathf.Max(350f, Spec.TopAttackDiveRangeMeters);
+
+            if (horizDist <= diveRange)
+            {
+                // Terminal top-attack dive onto the armored vehicle turret roof.
+                Vector3 terminalPt = new Vector3(predictedTarget.x, predictedTarget.y + 1.0f, predictedTarget.z);
+                if (Physics.Linecast(
+                        myPos + (Vector3.up * 2f),
+                        terminalPt + (Vector3.up * 2f),
+                        out RaycastHit termHit,
+                        TerrainClearanceMask,
+                        QueryTriggerInteraction.Ignore))
+                {
+                    terminalPt.y = Mathf.Max(terminalPt.y, termHit.point.y + 42f);
+                    emergencyPullUpThisTick = true;
+                }
+
+                aimPoint = terminalPt;
+                return;
+            }
+
+            EnsureDynamicRouteUpdated(myPos, targetPos, horizDist, targetMoveThreshold: 450f);
+
+            float currentSpeed = Missile.rb != null ? Missile.rb.velocity.magnitude : cruiseSpeed;
+            float lookaheadMeters = Mathf.Clamp(Mathf.Max(currentSpeed, 110f) * 1.45f, 180f, 340f);
+            float seaIngressFloor = seaY + 28f;
+            Vector3 baseLookahead = AdvanceRouteLookahead(myPos, predictedTarget, lookaheadMeters, seaIngressFloor, out _);
+
+            float localSurfaceY = SampleTerrainY(myPos.x, myPos.z, seaY);
+            if (localSurfaceY > seaY + 0.5f)
+            {
+                baseLookahead.y = Mathf.Max(baseLookahead.y, localSurfaceY + LandTreeClearanceMeters);
+            }
+
+            uint droneId = Missile.persistentID.IsValid ? Missile.persistentID.Id : (uint)Missile.GetInstanceID();
+            float swarmAltOffset = (((int)(droneId % 5)) - 2) * 7f;
+            baseLookahead.y = Mathf.Max(seaIngressFloor, baseLookahead.y + swarmAltOffset);
+
+            // Blend toward target azimuth and pop up into top-attack window just before diveRange.
+            float popupOuterRange = diveRange + 650f;
+            if (horizDist <= popupOuterRange)
+            {
+                float popupBlend = Mathf.InverseLerp(popupOuterRange, diveRange, horizDist);
+                baseLookahead.x = Mathf.Lerp(baseLookahead.x, predictedTarget.x, popupBlend);
+                baseLookahead.z = Mathf.Lerp(baseLookahead.z, predictedTarget.z, popupBlend);
+                float popupAlt = predictedTarget.y + Mathf.Max(120f, Spec.LoiterCruiseAltitudeMeters);
+                baseLookahead.y = Mathf.Lerp(baseLookahead.y, Mathf.Max(baseLookahead.y, popupAlt), popupBlend);
+            }
+
+            Vector3 velDir = Missile.rb != null && Missile.rb.velocity.sqrMagnitude > 25f
+                ? Missile.rb.velocity.normalized
+                : Missile.transform.forward;
+            if (Physics.Raycast(myPos, velDir, out RaycastHit fwdHit, 380f, TerrainClearanceMask, QueryTriggerInteraction.Ignore))
+            {
+                baseLookahead.y = Mathf.Max(baseLookahead.y, fwdHit.point.y + 68f);
+                emergencyPullUpThisTick = true;
+            }
+
+            if (Physics.Raycast(myPos - (Vector3.up * 8f), velDir, out RaycastHit bellyHit, 300f, TerrainClearanceMask, QueryTriggerInteraction.Ignore))
+            {
+                baseLookahead.y = Mathf.Max(baseLookahead.y, bellyHit.point.y + 68f);
+                emergencyPullUpThisTick = true;
+            }
+
+            baseLookahead.y = Mathf.Max(seaIngressFloor, baseLookahead.y);
+            aimPoint = baseLookahead;
+        }
+
+        private void SteerLoiteringTopAttackDrone(
+            Vector3 myPos,
+            Vector3 targetPos,
+            Vector3 targetVel,
+            float dist,
+            Vector3 aimPoint,
+            float dt)
+        {
+            if (Missile.rb == null)
+            {
+                return;
+            }
+
+            Vector3 desiredDir = (aimPoint - myPos).normalized;
+            Vector3 vel = Missile.rb.velocity;
+            float speed = vel.magnitude;
+            if (speed < 25f || desiredDir.sqrMagnitude < 0.01f)
+            {
+                return;
+            }
+
+            Vector3 horizToTarget = new Vector3(targetPos.x - myPos.x, 0f, targetPos.z - myPos.z);
+            float horizDist = horizToTarget.magnitude;
+            bool inTerminalDive = horizDist <= Mathf.Max(350f, Spec.TopAttackDiveRangeMeters);
+
+            float cruiseTargetSpeed = Mathf.Max(85f, Spec.CruiseSpeedMps > 0f ? Spec.CruiseSpeedMps : 135f);
+            float diveTargetSpeed = Spec.MaxSpeedMps > cruiseTargetSpeed ? Spec.MaxSpeedMps : cruiseTargetSpeed * 1.25f;
+            float targetSpeed = inTerminalDive ? diveTargetSpeed : cruiseTargetSpeed;
+            float nextSpeed = Mathf.MoveTowards(speed, targetSpeed, dt * (inTerminalDive ? 55f : 40f));
+
+            Vector3 prevDir = vel / speed;
+            float turnRate = emergencyPullUpThisTick ? 3.4f : (inTerminalDive ? 2.45f : 1.55f);
+            Vector3 newDir = Vector3.RotateTowards(prevDir, desiredDir, dt * turnRate, 0f);
+
+            if (!inTerminalDive || dist > 260f)
+            {
+                float seaY = Datum.LocalSeaY;
+                float localTerrainY = SampleTerrainY(myPos.x, myPos.z, seaY);
+                float aheadTerrainY = SampleTerrainY(myPos.x + (newDir.x * 95f), myPos.z + (newDir.z * 95f), seaY);
+                float highestLocal = Mathf.Max(localTerrainY, aheadTerrainY);
+                float safeFloorY = highestLocal > seaY + 0.5f
+                    ? highestLocal + (inTerminalDive ? 18f : 38f)
+                    : seaY + (inTerminalDive ? 8f : 18f);
+                Vector3 nextPosCheck = myPos + (newDir * (nextSpeed * Mathf.Max(dt, 0.25f)));
+                if (nextPosCheck.y < safeFloorY)
+                {
+                    float neededDy = Mathf.Clamp((safeFloorY - myPos.y) / Mathf.Max(40f, nextSpeed * 0.55f), 0.04f, 0.60f);
+                    newDir.y = Mathf.Max(neededDy, newDir.y);
+                    newDir.Normalize();
+                }
+            }
+
+            Vector3 prevFlat = new Vector3(prevDir.x, 0f, prevDir.z);
+            Vector3 newFlat = new Vector3(newDir.x, 0f, newDir.z);
+            float signedYawRateDeg = (prevFlat.sqrMagnitude > 0.001f && newFlat.sqrMagnitude > 0.001f && dt > 0.0001f)
+                ? Vector3.SignedAngle(prevFlat.normalized, newFlat.normalized, Vector3.up) / dt
+                : 0f;
+            float targetBankDeg = Mathf.Clamp(signedYawRateDeg * 1.15f, -45f, 45f);
+            currentBankDeg = Mathf.Lerp(currentBankDeg, targetBankDeg, 1f - Mathf.Exp(-dt * 7.0f));
+
+            Vector3 newVel = newDir * nextSpeed;
+            Missile.rb.velocity = newVel;
+            if (newVel.sqrMagnitude > 1f)
+            {
+                Quaternion lookRot = Quaternion.LookRotation(newDir, Vector3.up);
+                Missile.rb.MoveRotation(lookRot * Quaternion.Euler(0f, 0f, currentBankDeg * bankRollSign));
+            }
+            _ = targetVel;
+        }
+
         private void UpdateSeaSkimmingEvasiveProfile(
             Vector3 myPos,
             Vector3 targetPos,
@@ -1395,92 +2054,11 @@ namespace MDSFramework.Missiles
                 return;
             }
 
-            bool needsTargetMovedRecompute =
-                Time.time - lastRouteRecomputeTime >= 3.5f &&
-                dist > 1400f &&
-                Vector3.SqrMagnitude(targetPos - routeTargetAnchorPos) > 900f * 900f;
-
-            bool needsLiveAaRecompute = false;
-            if (Time.time >= nextLiveAaCheckTime)
-            {
-                nextLiveAaCheckTime = Time.time + 1.5f;
-                if (dist > 1800f &&
-                    Time.time - lastRouteRecomputeTime >= 3.5f &&
-                    routePrecomputed &&
-                    precomputedRoutePoints.Count >= 2)
-                {
-                    needsLiveAaRecompute = IsUpcomingRouteEnteringNewAaThreat(targetPos);
-                }
-            }
-
-            if (!routePrecomputed ||
-                precomputedRoutePoints.Count < 2 ||
-                needsTargetMovedRecompute ||
-                needsLiveAaRecompute)
-            {
-                PrecomputeSeaWraithRoute(myPos, targetPos);
-            }
-
-            int ptCount = precomputedRoutePoints.Count;
-            if (ptCount >= 2)
-            {
-                int searchEnd = Mathf.Min(ptCount - 1, routeCursorIndex + 16);
-                int bestIdx = routeCursorIndex;
-                float bestSq = float.MaxValue;
-                for (int i = routeCursorIndex; i <= searchEnd; i++)
-                {
-                    Vector3 p = precomputedRoutePoints[i];
-                    float dx = p.x - myPos.x;
-                    float dz = p.z - myPos.z;
-                    float dSq = (dx * dx) + (dz * dz);
-                    if (dSq < bestSq)
-                    {
-                        bestSq = dSq;
-                        bestIdx = i;
-                    }
-                }
-
-                routeCursorIndex = bestIdx;
-            }
+            EnsureDynamicRouteUpdated(myPos, targetPos, dist, targetMoveThreshold: 900f);
 
             float currentSpeed = Missile.rb != null ? Missile.rb.velocity.magnitude : Spec.CruiseSpeedMps;
             float lookaheadMeters = Mathf.Clamp(Mathf.Max(currentSpeed, 220f) * 1.15f, 260f, 440f);
-            Vector3 baseLookahead = targetPos;
-            float maxChordSafeY = seaSkimFloor;
-            bool anyOverLand = false;
-
-            if (ptCount >= 2)
-            {
-                Vector3 prevPt = precomputedRoutePoints[routeCursorIndex];
-                maxChordSafeY = Mathf.Max(maxChordSafeY, prevPt.y);
-                anyOverLand |= precomputedRouteOverLand[routeCursorIndex];
-
-                float accumulated = 0f;
-                int idx = routeCursorIndex;
-                Vector3 chosenPt = prevPt;
-                while (idx + 1 < ptCount)
-                {
-                    Vector3 nextPt = precomputedRoutePoints[idx + 1];
-                    float segLen = Vector2.Distance(new Vector2(prevPt.x, prevPt.z), new Vector2(nextPt.x, nextPt.z));
-                    maxChordSafeY = Mathf.Max(maxChordSafeY, nextPt.y);
-                    anyOverLand |= precomputedRouteOverLand[idx + 1];
-
-                    if (accumulated + segLen >= lookaheadMeters && segLen > 0.1f)
-                    {
-                        float t = Mathf.Clamp01((lookaheadMeters - accumulated) / segLen);
-                        chosenPt = Vector3.Lerp(prevPt, nextPt, t);
-                        break;
-                    }
-
-                    accumulated += segLen;
-                    prevPt = nextPt;
-                    chosenPt = nextPt;
-                    idx++;
-                }
-
-                chosenPt.y = Mathf.Max(chosenPt.y, maxChordSafeY);
-                baseLookahead = chosenPt;
-            }
+            Vector3 baseLookahead = AdvanceRouteLookahead(myPos, targetPos, lookaheadMeters, seaSkimFloor, out bool anyOverLand);
 
             float localSurfaceY = SampleTerrainY(myPos.x, myPos.z, seaY);
             if (localSurfaceY > seaY + 0.5f)
@@ -1619,12 +2197,16 @@ namespace MDSFramework.Missiles
                     new Vector2(waypoints[w + 1].x, waypoints[w + 1].z));
             }
 
+            bool isLoiter = Spec.FlightProfile == MissileFlightProfile.LoiteringTopAttack;
+            float baseCruiseFloor = isLoiter
+                ? seaY + 28f
+                : seaY + Mathf.Max(2.8f, Spec.SeaSkimAltitudeMeters);
+
             if (totalLen < 20f)
             {
-                float skimY = seaY + Mathf.Max(2.8f, Spec.SeaSkimAltitudeMeters);
-                precomputedRoutePoints.Add(new Vector3(startPos.x, Mathf.Max(startPos.y, skimY), startPos.z));
+                precomputedRoutePoints.Add(new Vector3(startPos.x, Mathf.Max(startPos.y, baseCruiseFloor), startPos.z));
                 precomputedRouteOverLand.Add(false);
-                precomputedRoutePoints.Add(new Vector3(targetPos.x, Mathf.Max(targetPos.y, skimY), targetPos.z));
+                precomputedRoutePoints.Add(new Vector3(targetPos.x, Mathf.Max(targetPos.y, baseCruiseFloor), targetPos.z));
                 precomputedRouteOverLand.Add(false);
                 routeCursorIndex = 0;
                 routePrecomputed = true;
@@ -1664,7 +2246,6 @@ namespace MDSFramework.Missiles
                 return;
             }
 
-            float seaSkimFloor = seaY + Mathf.Max(2.8f, Spec.SeaSkimAltitudeMeters);
             float[] rawY = new float[n];
             bool[] overLand = new bool[n];
 
@@ -1680,8 +2261,8 @@ namespace MDSFramework.Missiles
                 bool isLand = h > seaY + 0.5f;
                 overLand[i] = isLand;
                 rawY[i] = isLand
-                    ? Mathf.Max(seaSkimFloor, h + LandTreeClearanceMeters)
-                    : seaSkimFloor;
+                    ? Mathf.Max(baseCruiseFloor, h + LandTreeClearanceMeters)
+                    : baseCruiseFloor;
             }
 
             // Dilate peaks by +-2 samples (~200-320 m) so the missile clears cliff shoulders and canopies.
@@ -1798,7 +2379,9 @@ namespace MDSFramework.Missiles
 
                 if (u.GetComponent<ModularSiteBehavior>() is ModularSiteBehavior mdsSite &&
                     mdsSite.Spec != null &&
-                    mdsSite.Spec.Role != WeaponCascadeRole.AntiShipCoastal)
+                    mdsSite.Spec.Role != WeaponCascadeRole.AntiShipCoastal &&
+                    mdsSite.Spec.Role != WeaponCascadeRole.AntiVehicleDrone &&
+                    mdsSite.Spec.Role != WeaponCascadeRole.LogisticsHauler)
                 {
                     float radius = Mathf.Clamp(mdsSite.Spec.MaxEngagementRangeKm * 1000f, 4800f, 14000f);
                     float weight = mdsSite.Spec.Role == WeaponCascadeRole.FireControl ||
@@ -2144,7 +2727,7 @@ namespace MDSFramework.Missiles
 
         private void UpdateFlightControlSurfaceAnimation(float dt)
         {
-            if (rig == null || !Spec.IsAntiShip)
+            if (rig == null || (!Spec.IsAntiShip && !Spec.IsAntiVehicle))
             {
                 return;
             }
@@ -2462,11 +3045,13 @@ namespace MDSFramework.Missiles
 
         private void OnMissileDisabled(Unit _)
         {
+            StopCustomMotorAudio();
             CustomMissileTracker.Unregister(this);
         }
 
         private void OnDestroy()
         {
+            StopCustomMotorAudio();
             if (Missile != null)
             {
                 Missile.onDisableUnit -= OnMissileDisabled;

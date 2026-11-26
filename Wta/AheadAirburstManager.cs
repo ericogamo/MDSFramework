@@ -29,6 +29,7 @@ namespace MDSFramework.Wta
             internal float Elapsed;
             internal float ProgrammedFuseSeconds;
             internal float DamagePerBurst;
+            internal bool CanEngageGroundVehicles;
             internal GameObject? VisualGo;
             internal LineRenderer? Line;
             internal GameObject? ShellVisualGo;
@@ -92,7 +93,10 @@ namespace MDSFramework.Wta
             float interceptDist = Mathf.Max(15f, toIntercept.magnitude);
             Vector3 baseDir = toIntercept / interceptDist;
 
-            float standoffMeters = Mathf.Clamp(interceptDist * 0.025f, 12f, 32f);
+            bool isGroundTarget = target is GroundVehicle;
+            float standoffMeters = isGroundTarget
+                ? Mathf.Clamp(interceptDist * 0.01f, 3f, 8f)
+                : Mathf.Clamp(interceptDist * 0.025f, 12f, 32f);
             float baseFuseSeconds = Mathf.Max(0.03f, (interceptDist - standoffMeters) / muzzleVel);
             float burstDmg = Mathf.Max(15f, site.Spec.GunDamagePerBurst);
 
@@ -168,6 +172,7 @@ namespace MDSFramework.Wta
                     Elapsed = 0f,
                     ProgrammedFuseSeconds = Mathf.Max(0.025f, baseFuseSeconds + fuseOffset),
                     DamagePerBurst = burstDmg * 0.6f,
+                    CanEngageGroundVehicles = site.Spec.CanEngageGroundVehicles,
                     VisualGo = visualGo,
                     Line = line,
                     ShellVisualGo = shellVisualGo,
@@ -197,8 +202,15 @@ namespace MDSFramework.Wta
                 Vector3 nextPos = prevPos + (proj.Velocity * deltaTime);
                 proj.Elapsed += deltaTime;
 
-                if (Physics.Linecast(prevPos, nextPos, out RaycastHit _, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+                if (Physics.Linecast(prevPos, nextPos, out RaycastHit hit, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                 {
+                    if (proj.Target is GroundVehicle &&
+                        !proj.Target.disabled &&
+                        (hit.point - SmartEngagementEngine.GetTargetAimPosition(proj.Target)).sqrMagnitude <= 14f * 14f)
+                    {
+                        DetonateAheadCone(proj, hit.point);
+                    }
+
                     DestroyProjectileVisual(proj);
                     Projectiles.RemoveAt(i);
                     continue;
@@ -208,8 +220,9 @@ namespace MDSFramework.Wta
                 bool proximityPassed = false;
                 if (!fuseReached && proj.Target != null && !proj.Target.disabled)
                 {
-                    Vector3 toTarget = proj.Target.transform.position - nextPos;
-                    if (toTarget.sqrMagnitude <= 55f * 55f && Vector3.Dot(proj.Velocity, toTarget) <= 0f)
+                    Vector3 toTarget = SmartEngagementEngine.GetTargetAimPosition(proj.Target) - nextPos;
+                    float proxRadius = proj.Target is GroundVehicle ? 18f : 55f;
+                    if (toTarget.sqrMagnitude <= proxRadius * proxRadius && Vector3.Dot(proj.Velocity, toTarget) <= 0f)
                     {
                         proximityPassed = true;
                     }
@@ -308,7 +321,7 @@ namespace MDSFramework.Wta
             bool hitPrimary = false;
             if (proj.Target != null && !proj.Target.disabled)
             {
-                Vector3 toPrimary = proj.Target.transform.position - burstPos;
+                Vector3 toPrimary = SmartEngagementEngine.GetTargetAimPosition(proj.Target) - burstPos;
                 float dist = toPrimary.magnitude;
                 bool inRange = dist <= 50f;
                 bool inCone = dist <= 28f || (dist > 0.01f && Vector3.Dot(forward, toPrimary / dist) >= 0.90f);
@@ -334,20 +347,23 @@ namespace MDSFramework.Wta
                     continue;
                 }
 
-                if (!(cand is Missile || cand is Aircraft) ||
+                bool isGroundCand = cand is GroundVehicle;
+                if (!(cand is Missile || cand is Aircraft || (proj.CanEngageGroundVehicles && isGroundCand)) ||
                     !GameInteropHelpers.IsHostileToAffinity(cand, proj.OwnerFaction, proj.OwnerHq))
                 {
                     continue;
                 }
 
-                Vector3 toCand = cand.transform.position - burstPos;
+                Vector3 toCand = SmartEngagementEngine.GetTargetAimPosition(cand) - burstPos;
                 float dist = toCand.magnitude;
-                if (dist > 45f)
+                if (dist > (isGroundCand ? 20f : 45f))
                 {
                     continue;
                 }
 
-                bool inCone = dist <= 18f || (dist > 0.01f && Vector3.Dot(forward, toCand / dist) >= 0.951f);
+                bool inCone = isGroundCand
+                    ? (dist <= 10f || (dist > 0.01f && Vector3.Dot(forward, toCand / dist) >= 0.94f))
+                    : (dist <= 18f || (dist > 0.01f && Vector3.Dot(forward, toCand / dist) >= 0.951f));
                 if (!inCone)
                 {
                     continue;

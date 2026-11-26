@@ -13,6 +13,7 @@ namespace MDSFramework.Sensors
         internal Vector3 TriangulatedWorldPos;
         internal Vector3 Velocity;
         internal float LastUpdatedTime;
+        internal float LastDirectJamEventTime;
         internal int ObserverCount;
         internal bool VictimIsRadarOrFcu;
     }
@@ -181,6 +182,43 @@ namespace MDSFramework.Sensors
             return false;
         }
 
+        internal bool HasFreshDirectJamEvent(Unit? unit, float maxAgeSeconds = 0.65f)
+        {
+            if (unit == null || unit.disabled)
+            {
+                return false;
+            }
+
+            float now = Time.time;
+            for (int i = 0; i < activeHojTracks.Count; i++)
+            {
+                HojTrackEntry entry = activeHojTracks[i];
+                if (ReferenceEquals(entry.JammerUnit, unit) &&
+                    entry.LastDirectJamEventTime > 0f &&
+                    (now - entry.LastDirectJamEventTime) <= maxAgeSeconds)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        internal bool IsUnitActivelyEmittingEcm(Unit? unit, float maxJamPodAgeSeconds = 0.65f)
+        {
+            if (unit == null || unit.disabled || GameInteropHelpers.IsAircraftSplashed(unit))
+            {
+                return false;
+            }
+
+            if (unit is Aircraft ac && ac.GetECMIntensity() > 0.05f)
+            {
+                return true;
+            }
+
+            return HasFreshDirectJamEvent(unit, maxJamPodAgeSeconds);
+        }
+
         internal void NotifyJammingEmission(Unit victim, Unit jammer, float jamAmount)
         {
             if (victim == null || jammer == null || jammer.disabled)
@@ -257,7 +295,7 @@ namespace MDSFramework.Sensors
                 : jammerPos + new Vector3(Mathf.Sin(Time.time * 1.7f) * 85f, 0f, Mathf.Cos(Time.time * 1.3f) * 85f);
 
             Vector3 vel = jammer.rb != null ? jammer.rb.velocity : Vector3.zero;
-            UpsertHojTrack(victimFaction, jammer, estimatedPos, vel, observers, victimIsRadarOrFcu);
+            UpsertHojTrack(victimFaction, jammer, estimatedPos, vel, observers, victimIsRadarOrFcu, isDirectJamEvent: true);
         }
 
         private void UpsertHojTrack(
@@ -266,18 +304,25 @@ namespace MDSFramework.Sensors
             Vector3 estimatedPos,
             Vector3 vel,
             int observers,
-            bool victimIsRadarOrFcu)
+            bool victimIsRadarOrFcu,
+            bool isDirectJamEvent)
         {
+            float now = Time.time;
             for (int i = 0; i < activeHojTracks.Count; i++)
             {
                 HojTrackEntry entry = activeHojTracks[i];
                 if (entry.Faction == faction && ReferenceEquals(entry.JammerUnit, jammer))
                 {
                     bool wakeNow = (!entry.VictimIsRadarOrFcu && victimIsRadarOrFcu) ||
-                                   (Time.time - entry.LastUpdatedTime > 1.0f);
+                                   (now - entry.LastUpdatedTime > 1.0f);
                     entry.TriangulatedWorldPos = estimatedPos;
                     entry.Velocity = vel;
-                    entry.LastUpdatedTime = Time.time;
+                    entry.LastUpdatedTime = now;
+                    if (isDirectJamEvent)
+                    {
+                        entry.LastDirectJamEventTime = now;
+                    }
+
                     entry.ObserverCount = observers;
                     entry.VictimIsRadarOrFcu |= victimIsRadarOrFcu;
                     activeHojTracks[i] = entry;
@@ -303,7 +348,8 @@ namespace MDSFramework.Sensors
                 JammerId = jammer.persistentID,
                 TriangulatedWorldPos = estimatedPos,
                 Velocity = vel,
-                LastUpdatedTime = Time.time,
+                LastUpdatedTime = now,
+                LastDirectJamEventTime = isDirectJamEvent ? now : -1f,
                 ObserverCount = observers,
                 VictimIsRadarOrFcu = victimIsRadarOrFcu
             });
@@ -384,7 +430,7 @@ namespace MDSFramework.Sensors
                 ? acPos
                 : acPos + new Vector3(Mathf.Sin(Time.time * 1.7f) * 85f, 0f, Mathf.Cos(Time.time * 1.3f) * 85f);
             Vector3 vel = ac.rb != null ? ac.rb.velocity : Vector3.zero;
-            UpsertHojTrack(faction, ac, estimatedPos, vel, observers, victimIsRadarOrFcu: false);
+            UpsertHojTrack(faction, ac, estimatedPos, vel, observers, victimIsRadarOrFcu: false, isDirectJamEvent: false);
         }
 
         internal void NotifyAradThreat(Radar? targetedRadar, Missile aradMissile)
@@ -967,9 +1013,15 @@ namespace MDSFramework.Sensors
             for (int i = activeHojTracks.Count - 1; i >= 0; i--)
             {
                 HojTrackEntry entry = activeHojTracks[i];
+                bool silentAircraft = entry.JammerUnit is Aircraft ac &&
+                                      ac.GetECMIntensity() <= 0.05f &&
+                                      (entry.LastDirectJamEventTime <= 0f || now - entry.LastDirectJamEventTime > 1.2f) &&
+                                      (now - entry.LastUpdatedTime) > 1.5f;
+
                 if (entry.JammerUnit == null ||
                     entry.JammerUnit.disabled ||
                     GameInteropHelpers.IsAircraftSplashed(entry.JammerUnit) ||
+                    silentAircraft ||
                     now - entry.LastUpdatedTime > HojTrackExpirySeconds)
                 {
                     activeHojTracks.RemoveAt(i);

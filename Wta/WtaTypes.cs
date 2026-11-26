@@ -35,6 +35,7 @@ namespace MDSFramework.Wta
         internal bool IsShellOrSmallMunition;
         internal bool IsArtilleryShell;
         internal bool IsShip;
+        internal bool IsGroundVehicle;
         internal float TargetMaxHp;
         internal int ExistingMissileAttacks;
         internal int ActiveHojMissileAttacks;
@@ -62,6 +63,7 @@ namespace MDSFramework.Wta
         internal bool IsInCommandNet;
         internal int CommandNetId;
         internal float AmmoRatio;
+        internal bool CanEngageGroundVehicles;
     }
 
     internal struct EngagementOrder

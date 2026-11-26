@@ -18,7 +18,8 @@ namespace MDSFramework.Api
         EarlyWarningRadar = 6,
         CommandControl = 7,
         AntiShipCoastal = 8,
-        LogisticsHauler = 9
+        LogisticsHauler = 9,
+        AntiVehicleDrone = 10
     }
 
     public enum SensorBand
@@ -38,6 +39,7 @@ namespace MDSFramework.Api
         Ballistic = 3,
         MarvTerminal = 4,
         Decoy = 5,
-        SeaSkimmingEvasive = 6
+        SeaSkimmingEvasive = 6,
+        LoiteringTopAttack = 7
     }
 }

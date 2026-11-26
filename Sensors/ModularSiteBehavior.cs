@@ -128,6 +128,44 @@ namespace MDSFramework.Sensors
             RequestRearmIfNeeded();
         }
 
+        internal void NotifyRearmed(int roundsAdded)
+        {
+            if (roundsAdded <= 0 || Spec == null)
+            {
+                return;
+            }
+
+            float reloadPause = Spec.Role == WeaponCascadeRole.CloseInGun ? 8f : 18f;
+            CooldownRemaining = Mathf.Max(CooldownRemaining, reloadPause);
+        }
+
+        private static bool IsWithinFriendlyRearmerRange(Unit unit)
+        {
+            var rearmers = unit.NetworkHQ?.RearmMissionController?.Rearmers;
+            if (rearmers == null || rearmers.Count == 0)
+            {
+                return false;
+            }
+
+            GlobalPosition pos = unit.GlobalPosition();
+            for (int i = 0; i < rearmers.Count; i++)
+            {
+                Rearmer? r = rearmers[i];
+                if (r != null
+                    && r.Unit != null
+                    && !r.Unit.disabled
+                    && !ReferenceEquals(r.Unit, unit)
+                    && r.Capacity > 0f
+                    && r.Range > 0f
+                    && FastMath.InRange(pos, r.GetPosition(), r.Range))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         internal void RequestRearmIfNeeded()
         {
             if (Unit == null || Unit.disabled || !Unit.IsServer || SuspendedInTransit || IsVehicleMoving || Unit.NetworkHQ == null)
@@ -158,14 +196,15 @@ namespace MDSFramework.Sensors
                     anyMissing = true;
                 }
 
-                int threshold = full <= 8 ? full - 1 : Mathf.Max(1, Mathf.FloorToInt(full * 0.5f));
+                int threshold = full <= 1 ? 0 : Mathf.FloorToInt(full * 0.5f);
                 if (cur <= threshold)
                 {
                     needsRearm = true;
                 }
             }
 
-            if (needsRearm)
+            bool inSupplyRadius = needsRearm && IsWithinFriendlyRearmerRange(Unit);
+            if (inSupplyRadius)
             {
                 if (Unit is Container)
                 {
@@ -178,7 +217,7 @@ namespace MDSFramework.Sensors
                     Unit.RequestRearm();
                 }
             }
-            else if (!anyMissing && Unit.HasRequestedRearm)
+            else if ((!anyMissing || !inSupplyRadius) && Unit.HasRequestedRearm)
             {
                 Unit.HasRequestedRearm = false;
                 Unit.NetworkHQ.RearmMissionController?.DeregisterNeedsRearm(Unit);

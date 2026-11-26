@@ -67,6 +67,8 @@ namespace MDSFramework.Deployment
                         {
                             site.PrimaryAmmoRemaining = Math.Min(maxCapacity, Math.Max(0, site.PrimaryAmmoRemaining) + delta);
                         }
+
+                        site.NotifyRearmed(delta);
                     }
                     else
                     {
@@ -120,22 +122,37 @@ namespace MDSFramework.Deployment
         {
             weaponStation = station;
             int added = Math.Max(0, ammoToRearm);
+            int actualAdded = 0;
             if (site != null)
             {
                 if (isSecondarySlot)
                 {
-                    site.SecondaryAmmoRemaining = Math.Min(maxCapacity, Math.Max(0, site.SecondaryAmmoRemaining) + added);
+                    int before = Math.Max(0, site.SecondaryAmmoRemaining);
+                    int after = Math.Min(maxCapacity, before + added);
+                    site.SecondaryAmmoRemaining = after;
+                    actualAdded = Math.Max(0, after - before);
                 }
                 else
                 {
-                    site.PrimaryAmmoRemaining = Math.Min(maxCapacity, Math.Max(0, site.PrimaryAmmoRemaining) + added);
+                    int before = Math.Max(0, site.PrimaryAmmoRemaining);
+                    int after = Math.Min(maxCapacity, before + added);
+                    site.PrimaryAmmoRemaining = after;
+                    actualAdded = Math.Max(0, after - before);
+                }
+
+                if (actualAdded > 0)
+                {
+                    site.NotifyRearmed(actualAdded);
                 }
             }
             else
             {
+                int before = fallbackAmmo;
                 fallbackAmmo = Math.Min(maxCapacity, fallbackAmmo + added);
+                actualAdded = Math.Max(0, fallbackAmmo - before);
             }
 
+            _ = actualAdded;
             SyncToStation();
             site?.RequestRearmIfNeeded();
             weaponStation?.Updated();
@@ -327,7 +344,9 @@ namespace MDSFramework.Deployment
 
             info.weaponName = "35mm AHEAD Airburst";
             info.shortName = "35mm AHEAD";
-            info.description = $"{pkg.DisplayName} 35x228mm KETF programmable tungsten airburst CIWS.";
+            info.description = spec.CanEngageGroundVehicles
+                ? $"{pkg.DisplayName} 35x228mm KETF programmable tungsten airburst CIWS & anti-vehicle autocannon."
+                : $"{pkg.DisplayName} 35x228mm KETF programmable tungsten airburst CIWS.";
             info.gun = true;
             info.missile = false;
             info.energy = false;
@@ -346,7 +365,7 @@ namespace MDSFramework.Deployment
                 lineOfSight = true,
                 minRange = Mathf.Max(20f, spec.MinEngagementRangeKm * 1000f),
                 maxRange = Mathf.Max(1000f, spec.MaxEngagementRangeKm * 1000f),
-                minAltitude = 0f,
+                minAltitude = spec.CanEngageGroundVehicles ? -50f : 0f,
                 maxAltitude = 4500f,
                 maxSpeed = 1600f
             };
@@ -354,7 +373,7 @@ namespace MDSFramework.Deployment
             {
                 antiAir = 0.85f,
                 antiMissile = 0.92f,
-                antiSurface = 0.35f,
+                antiSurface = spec.CanEngageGroundVehicles ? 0.65f : 0.35f,
                 antiRadar = 0f
             };
             return info;
@@ -422,44 +441,63 @@ namespace MDSFramework.Deployment
 
             float effRangeKm = Mathf.Max(missileSpec.MaxEngagementRangeKm, siteSpec.MaxEngagementRangeKm);
             bool isAntiShip = missileSpec.IsAntiShip || siteSpec.Role == WeaponCascadeRole.AntiShipCoastal;
+            bool isAntiVehicle = missileSpec.IsAntiVehicle || siteSpec.Role == WeaponCascadeRole.AntiVehicleDrone;
             info.weaponName = missileSpec.DisplayName;
             info.shortName = string.IsNullOrEmpty(missileSpec.AircraftMountShortName)
                 ? missileSpec.DisplayName
                 : missileSpec.AircraftMountShortName;
             info.description = isAntiShip
                 ? $"{pkg.DisplayName} | {missileSpec.FlightProfile} AShM ({effRangeKm:0.#} km)."
-                : $"{pkg.DisplayName} | {missileSpec.FlightProfile} SAM ({effRangeKm:0.#} km).";
+                : isAntiVehicle
+                    ? $"{pkg.DisplayName} | {missileSpec.FlightProfile} Loitering AT Munition ({effRangeKm:0.#} km)."
+                    : $"{pkg.DisplayName} | {missileSpec.FlightProfile} SAM ({effRangeKm:0.#} km).";
             info.missile = true;
             info.gun = false;
             info.energy = false;
             info.cargo = false;
-            info.overHorizon = isAntiShip || effRangeKm >= 25f;
-            info.muzzleVelocity = isAntiShip ? 306f : Mathf.Max(400f, missileSpec.CruiseSpeedMps);
-            info.maxSpeed = isAntiShip ? 306f : Mathf.Max(400f, missileSpec.CruiseSpeedMps);
+            info.overHorizon = isAntiShip || isAntiVehicle || effRangeKm >= 25f;
+            info.muzzleVelocity = isAntiShip
+                ? 306f
+                : isAntiVehicle
+                    ? Mathf.Max(90f, missileSpec.CruiseSpeedMps)
+                    : Mathf.Max(400f, missileSpec.CruiseSpeedMps);
+            info.maxSpeed = isAntiShip
+                ? 306f
+                : isAntiVehicle
+                    ? Mathf.Max(110f, missileSpec.MaxSpeedMps > 0f ? missileSpec.MaxSpeedMps : missileSpec.CruiseSpeedMps)
+                    : Mathf.Max(400f, missileSpec.CruiseSpeedMps);
             info.fireInterval = Mathf.Max(0.5f, siteSpec.FireCooldownSeconds);
             info.blastDamage = Mathf.Max(10f, missileSpec.BlastYield);
             info.costPerRound = Mathf.Max(0.5f, missileSpec.RearmCostPerRound);
             info.massPerRound = isAntiShip
-                ? Mathf.Clamp(missileSpec.AircraftMountMassKg > 0f ? missileSpec.AircraftMountMassKg : 416f, 120f, 450f)
-                : 120f;
+                ? Mathf.Clamp(missileSpec.AircraftMountMassKg > 0f ? missileSpec.AircraftMountMassKg : 416f, 180f, 950f)
+                : isAntiVehicle
+                    ? 28f
+                    : missileSpec.IsAbmInterceptor
+                        ? 900f
+                        : effRangeKm >= 45f
+                            ? 550f
+                            : effRangeKm >= 25f
+                                ? 320f
+                                : 180f;
             info.weaponIcon = TryLoadWeaponIconSprite(pkg, missileSpec.IconRelativePath);
-            info.visibilityWhenFired = isAntiShip ? 120f : 240f;
+            info.visibilityWhenFired = isAntiVehicle ? 60f : (isAntiShip ? 120f : 240f);
             info.targetRequirements = new TargetRequirements
             {
                 lineOfSight = !info.overHorizon,
                 minRange = Mathf.Max(200f, siteSpec.MinEngagementRangeKm * 1000f),
                 maxRange = effRangeKm * 1000f,
-                minAltitude = 0f,
-                maxAltitude = isAntiShip ? 120f : (missileSpec.IsAbmInterceptor ? 60000f : 25000f),
-                maxSpeed = isAntiShip ? 60f : (missileSpec.IsAbmInterceptor ? 5000f : 2200f)
+                minAltitude = isAntiVehicle ? -50f : 0f,
+                maxAltitude = isAntiShip ? 120f : (isAntiVehicle ? 1500f : (missileSpec.IsAbmInterceptor ? 60000f : 25000f)),
+                maxSpeed = (isAntiShip || isAntiVehicle) ? 60f : (missileSpec.IsAbmInterceptor ? 5000f : 2200f)
             };
-            info.effectiveness = isAntiShip
+            info.effectiveness = (isAntiShip || isAntiVehicle)
                 ? new RoleIdentity
                 {
                     antiAir = 0f,
                     antiMissile = 0f,
                     antiSurface = 0.96f,
-                    antiRadar = 0f
+                    antiRadar = isAntiVehicle ? 0.90f : 0f
                 }
                 : new RoleIdentity
                 {

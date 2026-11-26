@@ -487,7 +487,7 @@ namespace MDSFramework.Deployment
 
         private static bool RegisterMissileEntryLocked(Encyclopedia enc, ContractorPackage pkg, CustomMissileSpec spec)
         {
-            MissileDefinition? templateMissile = spec.IsAntiShip
+            MissileDefinition? templateMissile = (spec.IsAntiShip || spec.IsAntiVehicle)
                 ? GameInteropHelpers.ResolveEncyclopediaMissileDef(spec.BaseMissileCloneKey, preferBallisticOrSam: false)
                 : (GameInteropHelpers.ResolveEncyclopediaArhMissileDef(spec.BaseMissileCloneKey) ??
                    GameInteropHelpers.ResolveEncyclopediaMissileDef(spec.BaseMissileCloneKey, preferBallisticOrSam: true));
@@ -598,6 +598,7 @@ namespace MDSFramework.Deployment
                 WeaponCascadeRole.AbmVls => "VLS",
                 WeaponCascadeRole.AntiShipCoastal => "ASHM",
                 WeaponCascadeRole.LogisticsHauler => "HAUL",
+                WeaponCascadeRole.AntiVehicleDrone => "WASP",
                 _ => "MDS"
             };
         }
@@ -626,6 +627,15 @@ namespace MDSFramework.Deployment
                        $"{ammoCoastal} | Autonomous | Faction: {pkg.DefaultFaction}";
             }
 
+            if (spec.Role == WeaponCascadeRole.AntiVehicleDrone)
+            {
+                string ammoDrone = spec.PrimaryMagazineCapacity > 0
+                    ? $"{spec.PrimaryMagazineCapacity} drones"
+                    : $"{spec.MagazineCapacity} drones";
+                return $"{pkg.DisplayName} | Anti-Vehicle Loitering Swarm (20ft Elevating Container) | " +
+                       $"Range {spec.MinEngagementRangeKm:0.#}-{spec.MaxEngagementRangeKm:0.#} km | {ammoDrone} | Top-Attack EFP | Faction: {pkg.DefaultFaction}";
+            }
+
             string fcuTag = spec.RequiresFcuLink ? "Requires FCU link" : "Autonomous / Network Hub";
             string ammoTag = spec.PrimaryMagazineCapacity > 0 && spec.SecondaryMagazineCapacity > 0
                 ? $"{spec.PrimaryMagazineCapacity}+{spec.SecondaryMagazineCapacity} rounds"
@@ -642,9 +652,10 @@ namespace MDSFramework.Deployment
             string abmTag = spec.IsAbmInterceptor ? " | ABM Exo-KKV" : string.Empty;
             string hojTag = spec.SupportsActiveToPassiveHoj ? " | Active+Passive HOJ" : string.Empty;
             string ashmTag = spec.IsAntiShip ? $" | {Mathf.Max(2.5f, spec.SeaSkimAltitudeMeters):0.#}m Sea-Skim | Active ECCM/ECM | Evasive" : string.Empty;
+            string avTag = spec.IsAntiVehicle ? $" | {Mathf.Max(80f, spec.LoiterCruiseAltitudeMeters):0}m AGL Loitering Top-Attack | Tandem EFP" : string.Empty;
             string speedTag = spec.TargetMach > 0f ? $"Mach {spec.TargetMach:0.00}" : $"Cruise {spec.CruiseSpeedMps:0} m/s";
             return $"{pkg.DisplayName} | Profile: {spec.FlightProfile} | Range {spec.MaxEngagementRangeKm:0.#} km | " +
-                   $"{speedTag}{abmTag}{hojTag}{ashmTag}";
+                   $"{speedTag}{abmTag}{hojTag}{ashmTag}{avTag}";
         }
     }
 }

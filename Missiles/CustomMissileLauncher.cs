@@ -28,12 +28,19 @@ namespace MDSFramework.Missiles
                 return null;
             }
 
+            if (missileSpec.IsAntiVehicle && targetUnit is not GroundVehicle)
+            {
+                MdsLog.Debug($"[AntiVehicle] Blocked loitering launch of '{missileSpec.DisplayName}' against non-vehicle target '{targetUnit.unitName}'.");
+                return null;
+            }
+
             bool hasUnitRadar = launcherUnit.radar != null;
-            MissileDefinition? baseDef = (!hasUnitRadar && !missileSpec.IsAntiShip)
+            MissileDefinition? baseDef = (!hasUnitRadar && !missileSpec.IsAntiShip && !missileSpec.IsAntiVehicle)
                 ? GameInteropHelpers.ResolveEncyclopediaArhMissileDef(missileSpec.BaseMissileCloneKey)
                 : GameInteropHelpers.ResolveEncyclopediaMissileDef(
                     missileSpec.BaseMissileCloneKey,
                     preferBallisticOrSam: !missileSpec.IsAntiShip &&
+                        !missileSpec.IsAntiVehicle &&
                         (missileSpec.IsAbmInterceptor || missileSpec.MaxEngagementRangeKm >= 20f));
 
             if (baseDef == null || baseDef.unitPrefab == null)

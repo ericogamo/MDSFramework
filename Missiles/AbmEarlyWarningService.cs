@@ -84,13 +84,14 @@ namespace MDSFramework.Missiles
                 pending.MissileSpec != null &&
                 (pending.MissileSpec.IsAbmInterceptor ||
                  pending.MissileSpec.IsAntiShip ||
+                 pending.MissileSpec.IsAntiVehicle ||
                  (!hasBallisticGuidance && pending.MissileSpec.BlastYield <= MdsConfig.AbmBlastYieldThreshold.Value)))
             {
                 return;
             }
 
             if (CustomMissileTracker.TryGet(missile, out CustomMissileBehavior custom) &&
-                (custom.Spec.IsAbmInterceptor || custom.Spec.IsAntiShip))
+                (custom.Spec.IsAbmInterceptor || custom.Spec.IsAntiShip || custom.Spec.IsAntiVehicle))
             {
                 return;
             }
@@ -174,7 +175,7 @@ namespace MDSFramework.Missiles
 
             if (CustomMissileTracker.TryGet(missile, out CustomMissileBehavior custom))
             {
-                if (custom.Spec.IsAbmInterceptor || custom.Spec.IsAntiShip)
+                if (custom.Spec.IsAbmInterceptor || custom.Spec.IsAntiShip || custom.Spec.IsAntiVehicle)
                 {
                     return false;
                 }

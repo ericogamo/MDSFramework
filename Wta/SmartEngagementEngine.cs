@@ -103,6 +103,7 @@ namespace MDSFramework.Wta
         {
             IReadOnlyList<ModularSiteBehavior> allSites = SensorNetworkManager.Instance!.AllSites;
             int effectorCount = 0;
+            bool hasAntiVehicleEffector = false;
             SmartEngagementProfile? profile = null;
 
             for (int i = 0; i < allSites.Count && effectorCount < MaxEffectors; i++)
@@ -147,6 +148,12 @@ namespace MDSFramework.Wta
 
                 int totalCap = site.PrimaryMagazineSize + site.SecondaryMagazineSize;
                 float ammoRatio = totalCap > 0 ? Mathf.Clamp01((float)site.AmmoRemaining / totalCap) : 1f;
+                bool canEngageVehicles = site.Spec.CanEngageGroundVehicles ||
+                                         site.Spec.Role == WeaponCascadeRole.AntiVehicleDrone;
+                if (canEngageVehicles)
+                {
+                    hasAntiVehicleEffector = true;
+                }
 
                 effectorSiteBuffer[effectorCount] = site;
                 effectorBuffer[effectorCount] = new EffectorSnapshot
@@ -170,7 +177,8 @@ namespace MDSFramework.Wta
                         : 0.5f,
                     IsInCommandNet = site.IsInCommandNet && site.CommandNetId != 0,
                     CommandNetId = site.CommandNetId,
-                    AmmoRatio = ammoRatio
+                    AmmoRatio = ammoRatio,
+                    CanEngageGroundVehicles = canEngageVehicles
                 };
                 effectorCount++;
             }
@@ -198,7 +206,7 @@ namespace MDSFramework.Wta
             }
 
             FactionHQ? myHq = GameInteropHelpers.TryResolveFactionHQ(faction);
-            int threatCount = GatherThreatsForFaction(faction, myHq, allSites, now);
+            int threatCount = GatherThreatsForFaction(faction, myHq, allSites, hasAntiVehicleEffector, now);
 
             bool hasNearThreats = UpdateAutoPopUpAndStow(allSites, faction, profile, threatCount, now);
             bool activeMode = threatCount > 0 && hasNearThreats;
@@ -269,6 +277,7 @@ namespace MDSFramework.Wta
             FactionAffinity faction,
             FactionHQ? myHq,
             IReadOnlyList<ModularSiteBehavior> allSites,
+            bool hasAntiVehicleEffector,
             float now)
         {
             seenUnitToThreatIndex.Clear();
@@ -423,6 +432,11 @@ namespace MDSFramework.Wta
                         continue;
                     }
 
+                    if (!SensorNetworkManager.Instance.IsUnitActivelyEmittingEcm(entry.JammerUnit))
+                    {
+                        continue;
+                    }
+
                     uint idKey = entry.JammerId.IsValid
                         ? entry.JammerId.Id
                         : (uint)entry.JammerUnit.GetInstanceID();
@@ -496,8 +510,84 @@ namespace MDSFramework.Wta
                 }
             }
 
+            // Pass 6: Hostile ground vehicles within watch range of anti-vehicle effectors (tracked by HQ or detected with LOS).
+            if (hasAntiVehicleEffector)
+            {
+                if (myHq != null && myHq.trackingDatabase != null)
+                {
+                    foreach (KeyValuePair<PersistentID, TrackingInfo> kv in myHq.trackingDatabase)
+                    {
+                        if (count >= MaxThreats)
+                        {
+                            break;
+                        }
+
+                        TrackingInfo info = kv.Value;
+                        if (info == null || !info.TryGetUnit(out Unit target) || target == null || target.disabled || target is not GroundVehicle gv)
+                        {
+                            continue;
+                        }
+
+                        if (!GameInteropHelpers.IsHostileToAffinity(gv, faction, myHq) ||
+                            !IsWithinAnyAntiVehicleWatchRange(gv, allSites, faction))
+                        {
+                            continue;
+                        }
+
+                        AddOrUpdateThreat(gv, info.missileAttacks, ref count);
+                    }
+                }
+
+                if (allUnits != null)
+                {
+                    for (int i = 0; i < allUnits.Count && count < MaxThreats; i++)
+                    {
+                        if (allUnits[i] is not GroundVehicle gv ||
+                            gv.disabled ||
+                            !GameInteropHelpers.IsHostileToAffinity(gv, faction, myHq))
+                        {
+                            continue;
+                        }
+
+                        if (IsWithinAnyAntiVehicleWatchRange(gv, allSites, faction) &&
+                            IsWithinAnyFriendlySiteSensor(gv, allSites, faction))
+                        {
+                            AddOrUpdateThreat(gv, GetExistingMissileAttacks(myHq, gv), ref count);
+                        }
+                    }
+                }
+            }
+
             _ = now;
             return count;
+        }
+
+        private static bool IsWithinAnyAntiVehicleWatchRange(
+            GroundVehicle gv,
+            IReadOnlyList<ModularSiteBehavior> allSites,
+            FactionAffinity faction)
+        {
+            Vector3 gvPos = gv.transform.position;
+            for (int i = 0; i < allSites.Count; i++)
+            {
+                ModularSiteBehavior site = allSites[i];
+                if (!site.IsAlive ||
+                    site.SuspendedInTransit ||
+                    site.Faction != faction ||
+                    site.Unit == null ||
+                    (!site.Spec.CanEngageGroundVehicles && site.Spec.Role != WeaponCascadeRole.AntiVehicleDrone))
+                {
+                    continue;
+                }
+
+                float watchRange = Mathf.Max(4500f, site.Spec.MaxEngagementRangeKm * 1500f);
+                if ((site.Unit.transform.position - gvPos).sqrMagnitude <= watchRange * watchRange)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool IsWithinAnyAntiShipOrFriendlySensor(Ship ship, IReadOnlyList<ModularSiteBehavior> allSites, FactionAffinity faction)
@@ -622,6 +712,20 @@ namespace MDSFramework.Wta
             return 0;
         }
 
+        internal static Vector3 GetTargetAimPosition(Unit target)
+        {
+            Vector3 pos = target.transform.position;
+            if (target is GroundVehicle)
+            {
+                float height = target.definition != null && target.definition.height > 0.2f
+                    ? target.definition.height
+                    : Mathf.Max(2.2f, target.maxRadius);
+                pos.y += Mathf.Clamp(height * 0.5f, 1.0f, 2.4f);
+            }
+
+            return pos;
+        }
+
         private void AddOrUpdateThreat(
             Unit target,
             int existingAttacks,
@@ -643,12 +747,13 @@ namespace MDSFramework.Wta
                 return;
             }
 
-            Vector3 pos = overridePos ?? target.transform.position;
+            Vector3 pos = overridePos ?? GetTargetAimPosition(target);
             Vector3 vel = overrideVel ?? (target.rb != null ? target.rb.velocity : Vector3.zero);
             float alt = pos.y - Datum.LocalSeaY;
             bool isMissile = target is Missile;
             bool isAircraft = target is Aircraft;
             bool isShip = target is Ship;
+            bool isGroundVehicle = target is GroundVehicle;
             bool isBallistic = false;
             bool isNuclear = false;
             bool isArad = false;
@@ -689,6 +794,9 @@ namespace MDSFramework.Wta
                     ? Mathf.Max(target.definition.value, target.maxRadius * 15f)
                     : (target.maxRadius * 15f))
                 : 0f;
+            float vehicleValueMetric = isGroundVehicle
+                ? (target.definition != null ? Mathf.Max(target.definition.value, 15f) : 20f)
+                : 0f;
 
             float priority = 20f;
             if (isNuclear) priority += 200f;
@@ -702,6 +810,10 @@ namespace MDSFramework.Wta
             if (isShip)
             {
                 priority = 45f + Mathf.Clamp(shipSizeMetric * 0.04f, 0f, 90f) + (isEmittingRadar ? 15f : 0f);
+            }
+            else if (isGroundVehicle)
+            {
+                priority = 32f + Mathf.Clamp(vehicleValueMetric * 0.25f, 0f, 35f) + (isEmittingRadar ? 18f : 0f);
             }
 
             seenUnitToThreatIndex[idVal] = count;
@@ -743,7 +855,8 @@ namespace MDSFramework.Wta
                 IsShellOrSmallMunition = isShellOrSmallMunition,
                 IsArtilleryShell = isArtilleryShell,
                 IsShip = isShip,
-                TargetMaxHp = shipSizeMetric,
+                IsGroundVehicle = isGroundVehicle,
+                TargetMaxHp = isShip ? shipSizeMetric : vehicleValueMetric,
                 ExistingMissileAttacks = Math.Max(0, effectiveExistingAttacks),
                 ActiveHojMissileAttacks = Math.Max(0, activeHojInFlight),
                 AssignedThisTick = 0,
@@ -834,7 +947,7 @@ namespace MDSFramework.Wta
 
         private static bool IsWithinAnyFriendlySiteSensor(Unit target, IReadOnlyList<ModularSiteBehavior> allSites, FactionAffinity faction)
         {
-            Vector3 targetPos = target.transform.position;
+            Vector3 targetPos = GetTargetAimPosition(target);
             float speed = target.rb != null ? target.rb.velocity.magnitude : 0f;
             bool emitsRadar = target.HasRadarEmission();
             bool targetIsJamming = SensorNetworkManager.Instance != null &&
@@ -962,13 +1075,43 @@ namespace MDSFramework.Wta
                         }
                     }
                 }
+                else if (site.Spec.Role == WeaponCascadeRole.AntiVehicleDrone)
+                {
+                    float avWatchSq = Mathf.Pow(Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1050f), 2f);
+                    for (int t = 0; t < threatCount; t++)
+                    {
+                        if (threatBuffer[t].IsGroundVehicle &&
+                            (threatBuffer[t].WorldPos - sitePos).sqrMagnitude <= avWatchSq)
+                        {
+                            nearSite = true;
+                            break;
+                        }
+                    }
+                }
                 else
                 {
                     float siteWatchSq = Mathf.Max(popUpSq, Mathf.Pow(site.Spec.MaxEngagementRangeKm * 1150f, 2f));
+                    float groundWatchSq = Mathf.Pow(Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1250f), 2f);
                     for (int t = 0; t < threatCount; t++)
                     {
-                        if (!threatBuffer[t].IsShip &&
-                            (threatBuffer[t].WorldPos - sitePos).sqrMagnitude <= siteWatchSq)
+                        if (threatBuffer[t].IsShip)
+                        {
+                            continue;
+                        }
+
+                        if (threatBuffer[t].IsGroundVehicle)
+                        {
+                            if (site.Spec.CanEngageGroundVehicles &&
+                                (threatBuffer[t].WorldPos - sitePos).sqrMagnitude <= groundWatchSq)
+                            {
+                                nearSite = true;
+                                break;
+                            }
+
+                            continue;
+                        }
+
+                        if ((threatBuffer[t].WorldPos - sitePos).sqrMagnitude <= siteWatchSq)
                         {
                             nearSite = true;
                             break;
@@ -995,7 +1138,12 @@ namespace MDSFramework.Wta
             return anyNearThreat;
         }
 
-        private bool TryFindClosestThreatPos(Vector3 origin, int threatCount, float maxRangeMeters, out Vector3 worldPos)
+        private bool TryFindClosestThreatPos(
+            Vector3 origin,
+            int threatCount,
+            float maxRangeMeters,
+            out Vector3 worldPos,
+            bool includeGroundVehicles = false)
         {
             float bestDistSq = maxRangeMeters * maxRangeMeters;
             bool found = false;
@@ -1003,7 +1151,7 @@ namespace MDSFramework.Wta
 
             for (int t = 0; t < threatCount; t++)
             {
-                if (threatBuffer[t].IsShip)
+                if (threatBuffer[t].IsShip || (threatBuffer[t].IsGroundVehicle && !includeGroundVehicles))
                 {
                     continue;
                 }
@@ -1137,7 +1285,8 @@ namespace MDSFramework.Wta
                     bool isMissileRole = role == WeaponCascadeRole.ShortMedSam ||
                                          role == WeaponCascadeRole.LongRangeSam ||
                                          role == WeaponCascadeRole.AbmVls ||
-                                         role == WeaponCascadeRole.AntiShipCoastal;
+                                         role == WeaponCascadeRole.AntiShipCoastal ||
+                                         role == WeaponCascadeRole.AntiVehicleDrone;
 
                     for (int t = 0; t < threatCount; t++)
                     {
@@ -1160,7 +1309,9 @@ namespace MDSFramework.Wta
 
                         int effectiveMaxSim = role == WeaponCascadeRole.AntiShipCoastal
                             ? (th.TargetMaxHp >= 1200f ? 3 : 2)
-                            : maxSim;
+                            : role == WeaponCascadeRole.AntiVehicleDrone
+                                ? ((th.TargetMaxHp >= 25f || th.IsEmittingRadar) ? 6 : 3)
+                                : maxSim;
                         bool salvoBlocked = profile.UseSalvoDeconfliction &&
                                             role != WeaponCascadeRole.LaserHel &&
                                             role != WeaponCascadeRole.CloseInGun &&
@@ -1327,7 +1478,7 @@ namespace MDSFramework.Wta
 
                 float watchRangeM = Mathf.Max(profile.AutoPopUpRangeKm, site.Spec.MaxEngagementRangeKm * 1.4f) * 1000f;
                 if ((site.AmmoRemaining > 0 || site.Spec.Role == WeaponCascadeRole.LaserHel) &&
-                    TryFindClosestThreatPos(eff.WorldPos, threatCount, watchRangeM, out Vector3 watchPos))
+                    TryFindClosestThreatPos(eff.WorldPos, threatCount, watchRangeM, out Vector3 watchPos, includeGroundVehicles: site.Spec.CanEngageGroundVehicles))
                 {
                     site.TurretAim.SetAimWorldPosition(watchPos);
                 }
@@ -1459,6 +1610,97 @@ namespace MDSFramework.Wta
 
             // Stage 3: Networked coastal anti-ship effectors vs surface ships (respecting warship salvo cap).
             AssignNetworkedAntiShip(profile, effectorCount, threatCount, ref orderCount);
+
+            // Stage 3B: Networked loitering anti-vehicle drone containers vs hostile ground armor/SAMs.
+            AssignNetworkedAntiVehicle(profile, effectorCount, threatCount, ref orderCount);
+        }
+
+        private void AssignNetworkedAntiVehicle(
+            SmartEngagementProfile profile,
+            int effectorCount,
+            int threatCount,
+            ref int orderCount)
+        {
+            _ = profile;
+            for (int e = 0; e < effectorCount && orderCount < MaxOrders; e++)
+            {
+                EffectorSnapshot eff = effectorBuffer[e];
+                if (!eff.IsInCommandNet ||
+                    effectorUsedThisTick[e] ||
+                    eff.Role != WeaponCascadeRole.AntiVehicleDrone ||
+                    !eff.IsDeployed ||
+                    !eff.IsReadyToFire)
+                {
+                    continue;
+                }
+
+                ModularSiteBehavior? site = effectorSiteBuffer[e];
+                if (site == null)
+                {
+                    continue;
+                }
+
+                int bestThreatIdx = -1;
+                float bestScore = float.MinValue;
+                bool bestUseSecondary = false;
+                for (int t = 0; t < threatCount; t++)
+                {
+                    ThreatSnapshot th = threatBuffer[t];
+                    Unit? thUnit = threatUnitBuffer[t];
+                    if (thUnit == null || thUnit.disabled || !th.IsGroundVehicle)
+                    {
+                        continue;
+                    }
+
+                    int vehicleSalvoCap = (th.TargetMaxHp >= 25f || th.IsEmittingRadar) ? 6 : 3;
+                    if (th.ExistingMissileAttacks + th.AssignedThisTick >= vehicleSalvoCap)
+                    {
+                        continue;
+                    }
+
+                    float distSq = (th.WorldPos - eff.WorldPos).sqrMagnitude;
+                    if (distSq < eff.MinRangeMeters * eff.MinRangeMeters ||
+                        distSq > eff.MaxRangeMeters * eff.MaxRangeMeters)
+                    {
+                        continue;
+                    }
+
+                    float distKm = Mathf.Sqrt(distSq) * 0.001f;
+                    if (!TryChooseMissileSlot(site, ref th, distKm, out bool slotUseSecondary, out _, out _))
+                    {
+                        continue;
+                    }
+
+                    int currentSalvo = th.ExistingMissileAttacks + th.AssignedThisTick;
+                    float score = th.PriorityScore - (distKm * 1.1f) + (eff.AmmoRatio * 10f) - (currentSalvo * 4.5f);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestThreatIdx = t;
+                        bestUseSecondary = slotUseSecondary;
+                    }
+                }
+
+                if (bestThreatIdx < 0)
+                {
+                    continue;
+                }
+
+                effectorUsedThisTick[e] = true;
+                aimedThisTick[e] = true;
+                ThreatSnapshot updated = threatBuffer[bestThreatIdx];
+                updated.AssignedThisTick++;
+                threatBuffer[bestThreatIdx] = updated;
+
+                orderBuffer[orderCount++] = new EngagementOrder
+                {
+                    EffectorSiteIndex = eff.SiteIndex,
+                    ThreatIndex = bestThreatIdx,
+                    Kind = WtaEngagementKind.CustomMissile,
+                    UsePassiveHoj = false,
+                    UseSecondaryMissile = bestUseSecondary
+                };
+            }
         }
 
         private void AssignNetworkedAntiShip(
@@ -1923,12 +2165,22 @@ namespace MDSFramework.Wta
                 return spec.IsAntiShip ? 150f : float.MinValue;
             }
 
-            if (spec.IsAntiShip)
+            if (th.IsGroundVehicle)
+            {
+                return spec.IsAntiVehicle ? 150f : float.MinValue;
+            }
+
+            if (spec.IsAntiShip || spec.IsAntiVehicle)
             {
                 return float.MinValue;
             }
 
             if (spec.IsAbmInterceptor && !th.IsBallistic && !th.IsNuclear && th.AltitudeMeters < 4500f)
+            {
+                return float.MinValue;
+            }
+
+            if (spec.RequiresTargetEcmToTrack && !th.IsActivelyJamming)
             {
                 return float.MinValue;
             }
@@ -1973,6 +2225,16 @@ namespace MDSFramework.Wta
             if (role == WeaponCascadeRole.AntiShipCoastal)
             {
                 return th.IsShip;
+            }
+
+            if (role == WeaponCascadeRole.AntiVehicleDrone)
+            {
+                return th.IsGroundVehicle;
+            }
+
+            if (th.IsGroundVehicle)
+            {
+                return role == WeaponCascadeRole.CloseInGun && eff.CanEngageGroundVehicles;
             }
 
             if (th.IsShip || (!th.IsMissile && !th.IsAircraft))
@@ -2305,7 +2567,8 @@ namespace MDSFramework.Wta
             }
 
             Vector3 muzzlePos = GetMuzzleOrigin(site);
-            if (Physics.Linecast(muzzlePos, target.transform.position, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+            Vector3 aimPos = GetTargetAimPosition(target);
+            if (Physics.Linecast(muzzlePos, aimPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
             {
                 return;
             }
@@ -2366,6 +2629,7 @@ namespace MDSFramework.Wta
             MissileDefinition? baseDef = GameInteropHelpers.ResolveEncyclopediaMissileDef(
                 missileSpec.BaseMissileCloneKey,
                 preferBallisticOrSam: !missileSpec.IsAntiShip &&
+                    !missileSpec.IsAntiVehicle &&
                     (missileSpec.IsAbmInterceptor || missileSpec.MaxEngagementRangeKm >= 20f));
             if (baseDef == null || baseDef.unitPrefab == null)
             {
@@ -2457,9 +2721,23 @@ namespace MDSFramework.Wta
                 if (randTf != null)
                 {
                     UnitPart? candidate = randTf.GetComponent<UnitPart>();
-                    if (candidate != null && !candidate.IsDetached())
+                    if (candidate != null && !candidate.IsDetached() && candidate.hitPoints > 0.5f)
                     {
                         chosenPart = candidate;
+                    }
+                }
+
+                if (chosenPart == null)
+                {
+                    int startIdx = UnityEngine.Random.Range(0, target.partLookup.Count);
+                    for (int i = 0; i < target.partLookup.Count; i++)
+                    {
+                        UnitPart? p = target.partLookup[(startIdx + i) % target.partLookup.Count];
+                        if (p != null && !p.IsDetached() && p.hitPoints > 0.5f)
+                        {
+                            chosenPart = p;
+                            break;
+                        }
                     }
                 }
 
@@ -2479,9 +2757,12 @@ namespace MDSFramework.Wta
 
                 if (chosenPart != null)
                 {
+                    bool isGroundVehicle = target is GroundVehicle;
+                    float pierce = isFire ? 0f : (isGroundVehicle ? amount * 1.65f : amount);
+                    float blast = isFire ? 0f : (isGroundVehicle ? amount * 0.45f : amount * 0.35f);
                     chosenPart.TakeDamage(
-                        isFire ? 0f : amount,
-                        isFire ? 0f : amount * 0.35f,
+                        pierce,
+                        blast,
                         1f,
                         isFire ? amount : 0f,
                         0f,
