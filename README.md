@@ -10,7 +10,7 @@ Core framework mod for **Nuclear Option** (BepInEx 5): custom GLB 3D units & mis
 Install `MDSFramework` directly inside NOMM (auto-updates via NOMNOM).
 
 ### Manual Release ZIP
-1. Download `MDSFramework-v0.1.1.zip` from [Releases](https://github.com/ericogamo/MDSFramework/releases/latest).
+1. Download `MDSFramework-v0.1.2.zip` from [Releases](https://github.com/ericogamo/MDSFramework/releases/latest).
 2. Extract directly into `Nuclear Option\BepInEx\plugins\MDSFramework\` (so `MDSFramework.dll` sits inside `BepInEx\plugins\MDSFramework\`).
 
 ### From Git Clone

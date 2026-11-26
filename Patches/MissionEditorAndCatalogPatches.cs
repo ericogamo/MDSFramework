@@ -5,6 +5,7 @@ using MDSFramework.Deployment;
 using MDSFramework.Missiles;
 using Mirage;
 using NuclearOption.MissionEditorScripts.Buttons;
+using NuclearOption.Networking;
 using NuclearOption.SavedMission;
 using UnityEngine;
 
@@ -17,13 +18,15 @@ namespace MDSFramework.Patches
             ModularUnitSpec? unitSpec,
             CustomMissileSpec? missileSpec,
             UnitDefinition? definition,
-            bool isCargoContainer)
+            bool isCargoContainer,
+            bool autoAttachSiteOnSpawn = false)
         {
             Package = package;
             UnitSpec = unitSpec;
             MissileSpec = missileSpec;
             Definition = definition;
             IsCargoContainer = isCargoContainer;
+            AutoAttachSiteOnSpawn = autoAttachSiteOnSpawn;
         }
 
         internal ContractorPackage Package { get; }
@@ -31,6 +34,7 @@ namespace MDSFramework.Patches
         internal CustomMissileSpec? MissileSpec { get; }
         internal UnitDefinition? Definition { get; }
         internal bool IsCargoContainer { get; }
+        internal bool AutoAttachSiteOnSpawn { get; }
     }
 
     internal static class PendingMdsSpawnScope
@@ -41,9 +45,10 @@ namespace MDSFramework.Patches
             ContractorPackage package,
             ModularUnitSpec spec,
             UnitDefinition? definition,
-            bool isCargoContainer = false)
+            bool isCargoContainer = false,
+            bool autoAttachSiteOnSpawn = false)
         {
-            Stack.Push(new PendingMdsSpawnContext(package, spec, null, definition, isCargoContainer));
+            Stack.Push(new PendingMdsSpawnContext(package, spec, null, definition, isCargoContainer, autoAttachSiteOnSpawn));
         }
 
         internal static void PushMissile(
@@ -588,6 +593,65 @@ namespace MDSFramework.Patches
         private static void Postfix(Missile __instance)
         {
             MissionEditorPatchHelpers.ApplyClientMissileVisualSync(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(VehicleDepot), nameof(VehicleDepot.TrySpawnVehicle), new[] { typeof(VehicleDefinition) })]
+    internal static class VehicleDepotTrySpawnVehiclePatch
+    {
+        private static void Prefix(VehicleDefinition? vehicleDefinition, out bool __state)
+        {
+            if (vehicleDefinition != null &&
+                MdsEncyclopediaCatalog.TryResolveUnitDefinition(vehicleDefinition, out ContractorPackage pkg, out ModularUnitSpec spec, out bool isCargo))
+            {
+                PendingMdsSpawnScope.PushUnit(pkg, spec, vehicleDefinition, isCargo, autoAttachSiteOnSpawn: true);
+                __state = true;
+                return;
+            }
+
+            __state = false;
+        }
+
+        private static void Finalizer(bool __state)
+        {
+            if (__state)
+            {
+                PendingMdsSpawnScope.Pop();
+            }
+        }
+    }
+
+    [HarmonyPatch(
+        typeof(Spawner),
+        nameof(Spawner.SpawnVehicle),
+        new[]
+        {
+            typeof(GameObject),
+            typeof(GlobalPosition),
+            typeof(Quaternion),
+            typeof(Vector3),
+            typeof(FactionHQ),
+            typeof(string),
+            typeof(float),
+            typeof(bool),
+            typeof(Player)
+        })]
+    internal static class SpawnerSpawnVehicleMdsPatch
+    {
+        private static void Postfix(GroundVehicle? __result)
+        {
+            if (__result != null &&
+                PendingMdsSpawnScope.TryPeek(out PendingMdsSpawnContext ctx) &&
+                ctx.AutoAttachSiteOnSpawn &&
+                ctx.UnitSpec != null)
+            {
+                MissionEditorPatchHelpers.ActivateMdsUnitOrPreview(
+                    __result,
+                    ctx.Definition,
+                    ctx.Package,
+                    ctx.UnitSpec,
+                    ctx.IsCargoContainer);
+            }
         }
     }
 }

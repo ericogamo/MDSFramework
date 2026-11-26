@@ -6,6 +6,8 @@ using MDSFramework.Assets3D;
 using MDSFramework.Missiles;
 using MDSFramework.Sensors;
 using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 
 namespace MDSFramework.Deployment
 {
@@ -49,6 +51,10 @@ namespace MDSFramework.Deployment
             if (animator != null && !animator.IsFullyDeployed)
             {
                 animator.TickAnimation(dt, allowTurretOverrides: false);
+                if (animator.IsFullyDeployed && animator.NormalizedProgress < 1f)
+                {
+                    animator.ForceProgress(1f);
+                }
             }
 
             if (finishedBurn)
@@ -228,6 +234,10 @@ namespace MDSFramework.Deployment
             {
                 GameInteropHelpers.BuildingWreckageField.SetValue(building, null);
             }
+            else if (unit is GroundVehicle gv && GameInteropHelpers.GroundVehicleWreckageField != null)
+            {
+                GameInteropHelpers.GroundVehicleWreckageField.SetValue(gv, null);
+            }
         }
 
         internal static GameObject? SpawnDestructionSequence(
@@ -266,7 +276,7 @@ namespace MDSFramework.Deployment
                 }
             }
 
-            Vector3 groundedPos = SnapToGround(worldPos);
+            Vector3 groundedPos = SnapToGround(worldPos, out Vector3 groundNormal);
             Transform parentOrigin = Datum.origin != null ? Datum.origin : unit.transform.parent;
 
             var wreckRoot = new GameObject($"MDS_Wreck_{spec.UnitId}");
@@ -323,7 +333,7 @@ namespace MDSFramework.Deployment
                 }
             }
 
-            SpawnNativeDestructionFx(groundedPos, worldRot, wreckRoot.transform);
+            SpawnNativeDestructionFx(groundedPos, groundNormal, worldRot, wreckRoot.transform, spec.IsMobileVehicle);
             SpawnPhysicsDebris(package, spec, groundedPos);
 
             MdsWreckController controller = wreckRoot.AddComponent<MdsWreckController>();
@@ -378,7 +388,7 @@ namespace MDSFramework.Deployment
             }
         }
 
-        private static Vector3 SnapToGround(Vector3 worldPos)
+        private static Vector3 SnapToGround(Vector3 worldPos, out Vector3 groundNormal)
         {
             if (Physics.Raycast(
                     worldPos + (Vector3.up * 4.0f),
@@ -388,13 +398,20 @@ namespace MDSFramework.Deployment
                     (int)PhysicsLayers.StaticsMask,
                     QueryTriggerInteraction.Ignore))
             {
+                groundNormal = hit.normal.sqrMagnitude > 0.001f ? hit.normal.normalized : Vector3.up;
                 return hit.point;
             }
 
+            groundNormal = Vector3.up;
             return worldPos;
         }
 
-        private static void SpawnNativeDestructionFx(Vector3 groundedPos, Quaternion worldRot, Transform wreckRootTf)
+        private static void SpawnNativeDestructionFx(
+            Vector3 groundedPos,
+            Vector3 groundNormal,
+            Quaternion worldRot,
+            Transform wreckRootTf,
+            bool isMobileVehicle)
         {
             GameAssets? assets = GameAssets.i;
             if (assets == null)
@@ -413,12 +430,25 @@ namespace MDSFramework.Deployment
 
             if (assets.scorchMarkDecal != null)
             {
-                GameObject scorch = UnityEngine.Object.Instantiate(
-                    assets.scorchMarkDecal,
-                    groundedPos + (Vector3.up * 0.03f),
-                    Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f),
-                    wreckRootTf);
-                scorch.transform.localScale = new Vector3(4.2f, 1.0f, 6.8f);
+                GameObject scorch = UnityEngine.Object.Instantiate(assets.scorchMarkDecal, wreckRootTf);
+                scorch.transform.position = groundedPos;
+                scorch.transform.localScale = Vector3.one;
+
+                DecalProjector? projector = scorch.GetComponent<DecalProjector>();
+                if (projector != null)
+                {
+                    float decalSize = isMobileVehicle ? 9.5f : 7.5f;
+                    projector.size = new Vector3(decalSize, decalSize, decalSize * 0.25f);
+                    projector.fadeFactor = 0.85f;
+                    Vector3 normal = groundNormal.sqrMagnitude > 0.001f ? groundNormal.normalized : Vector3.up;
+                    scorch.transform.rotation = Quaternion.LookRotation(-normal)
+                        * Quaternion.Euler(0f, 0f, UnityEngine.Random.Range(0f, 360f));
+                }
+                else
+                {
+                    scorch.transform.position = groundedPos + (Vector3.up * 0.03f);
+                    scorch.transform.rotation = Quaternion.Euler(0f, UnityEngine.Random.Range(0f, 360f), 0f);
+                }
             }
         }
 
@@ -544,6 +574,7 @@ namespace MDSFramework.Deployment
             sm.startLifetime = new ParticleSystem.MinMaxCurve(2.8f, 4.6f);
             sm.startSpeed = new ParticleSystem.MinMaxCurve(1.4f, 3.0f);
             sm.startSize = new ParticleSystem.MinMaxCurve(0.85f, 2.1f);
+            sm.startRotation = new ParticleSystem.MinMaxCurve(0f, Mathf.PI * 2f);
             sm.startColor = new ParticleSystem.MinMaxGradient(
                 new Color(0.08f, 0.08f, 0.08f, 0.72f),
                 new Color(0.16f, 0.14f, 0.13f, 0.48f));
@@ -558,6 +589,34 @@ namespace MDSFramework.Deployment
             ss.shapeType = ParticleSystemShapeType.Cone;
             ss.angle = 22f;
             ss.radius = 0.35f;
+
+            ParticleSystem.ColorOverLifetimeModule sc = smokePs.colorOverLifetime;
+            sc.enabled = true;
+            var smokeGrad = new Gradient();
+            smokeGrad.SetKeys(
+                new[]
+                {
+                    new GradientColorKey(Color.white, 0f),
+                    new GradientColorKey(Color.white, 1f)
+                },
+                new[]
+                {
+                    new GradientAlphaKey(0f, 0f),
+                    new GradientAlphaKey(0.65f, 0.15f),
+                    new GradientAlphaKey(0.45f, 0.55f),
+                    new GradientAlphaKey(0f, 1f)
+                });
+            sc.color = new ParticleSystem.MinMaxGradient(smokeGrad);
+
+            ParticleSystem.SizeOverLifetimeModule ssz = smokePs.sizeOverLifetime;
+            ssz.enabled = true;
+            ssz.size = new ParticleSystem.MinMaxCurve(1f, new AnimationCurve(
+                new Keyframe(0f, 0.55f),
+                new Keyframe(1f, 2.1f)));
+
+            ParticleSystem.RotationOverLifetimeModule srot = smokePs.rotationOverLifetime;
+            srot.enabled = true;
+            srot.z = new ParticleSystem.MinMaxCurve(-0.45f, 0.45f);
 
             smokePs.Play();
             outList.Add(smokePs);
@@ -592,6 +651,23 @@ namespace MDSFramework.Deployment
             fs.angle = 36f;
             fs.radius = 0.25f;
 
+            ParticleSystem.ColorOverLifetimeModule fc = sparkPs.colorOverLifetime;
+            fc.enabled = true;
+            var sparkGrad = new Gradient();
+            sparkGrad.SetKeys(
+                new[]
+                {
+                    new GradientColorKey(Color.white, 0f),
+                    new GradientColorKey(Color.white, 1f)
+                },
+                new[]
+                {
+                    new GradientAlphaKey(1f, 0f),
+                    new GradientAlphaKey(0.85f, 0.4f),
+                    new GradientAlphaKey(0f, 1f)
+                });
+            fc.color = new ParticleSystem.MinMaxGradient(sparkGrad);
+
             sparkPs.Play();
             outList.Add(sparkPs);
         }
@@ -600,7 +676,7 @@ namespace MDSFramework.Deployment
         {
             if (smokeSoftTexture == null)
             {
-                const int size = 32;
+                const int size = 64;
                 var tex = new Texture2D(size, size, TextureFormat.RGBA32, false)
                 {
                     wrapMode = TextureWrapMode.Clamp,
@@ -614,8 +690,8 @@ namespace MDSFramework.Deployment
                     for (int x = 0; x < size; x++)
                     {
                         float dx = (x * inv) - 1f;
-                        float r2 = (dx * dx) + (dy * dy);
-                        float alpha = r2 >= 1f ? 0f : Mathf.Pow(1f - r2, 2.2f);
+                        float r = Mathf.Sqrt((dx * dx) + (dy * dy));
+                        float alpha = r >= 1f ? 0f : Mathf.Pow(1f - r, 2.2f);
                         byte a = (byte)Mathf.Clamp(Mathf.RoundToInt(alpha * 255f), 0, 255);
                         pixels[(y * size) + x] = new Color32(255, 255, 255, a);
                     }
@@ -657,14 +733,68 @@ namespace MDSFramework.Deployment
                 mat.SetColor("_BaseColor", tint);
             }
 
+            if (mat.HasProperty("_ColorMode"))
+            {
+                mat.SetFloat("_ColorMode", 0f);
+            }
+
             if (mat.HasProperty("_Surface"))
             {
                 mat.SetFloat("_Surface", 1f);
             }
 
-            if (additive && mat.HasProperty("_Blend"))
+            if (mat.HasProperty("_Blend"))
             {
-                mat.SetFloat("_Blend", 2f);
+                mat.SetFloat("_Blend", additive ? 2f : 0f);
+            }
+
+            if (mat.HasProperty("_AlphaClip"))
+            {
+                mat.SetFloat("_AlphaClip", 0f);
+            }
+
+            if (mat.HasProperty("_SrcBlend"))
+            {
+                mat.SetInt("_SrcBlend", (int)BlendMode.SrcAlpha);
+            }
+
+            if (mat.HasProperty("_DstBlend"))
+            {
+                mat.SetInt("_DstBlend", (int)(additive ? BlendMode.One : BlendMode.OneMinusSrcAlpha));
+            }
+
+            if (mat.HasProperty("_SrcBlendAlpha"))
+            {
+                mat.SetInt("_SrcBlendAlpha", (int)BlendMode.One);
+            }
+
+            if (mat.HasProperty("_DstBlendAlpha"))
+            {
+                mat.SetInt("_DstBlendAlpha", (int)(additive ? BlendMode.One : BlendMode.OneMinusSrcAlpha));
+            }
+
+            if (mat.HasProperty("_ZWrite"))
+            {
+                mat.SetInt("_ZWrite", 0);
+            }
+
+            if (mat.HasProperty("_Cull"))
+            {
+                mat.SetInt("_Cull", (int)CullMode.Off);
+            }
+
+            mat.SetOverrideTag("RenderType", "Transparent");
+            mat.renderQueue = (int)RenderQueue.Transparent;
+            mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+            mat.DisableKeyword("_ALPHATEST_ON");
+            mat.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+            if (additive)
+            {
+                mat.EnableKeyword("_BLENDMODE_ADD");
+            }
+            else
+            {
+                mat.DisableKeyword("_BLENDMODE_ADD");
             }
 
             return mat;

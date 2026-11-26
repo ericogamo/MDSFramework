@@ -73,10 +73,12 @@ internal static class GameInteropHelpers
     {
         internal static readonly FieldInfo? Wheels = AccessTools.Field(typeof(GroundVehicle), "wheels");
         internal static readonly FieldInfo? WheelRadius = AccessTools.Field(typeof(GroundVehicle), "wheelRadius");
+        internal static readonly FieldInfo? Wreckage = AccessTools.Field(typeof(GroundVehicle), "wreckage");
     }
 
     internal static FieldInfo? GroundVehicleWheelsField => GroundVehicleFieldCache.Wheels;
     internal static FieldInfo? GroundVehicleWheelRadiusField => GroundVehicleFieldCache.WheelRadius;
+    internal static FieldInfo? GroundVehicleWreckageField => GroundVehicleFieldCache.Wreckage;
     internal static readonly FieldInfo? OpticalCruiseAltTargetField = AccessTools.Field(typeof(OpticalSeekerCruiseMissile), "altitudeTarget");
     internal static readonly FieldInfo? OpticalCruiseTermRangeField = AccessTools.Field(typeof(OpticalSeekerCruiseMissile), "terminalRange");
     internal static readonly FieldInfo? OpticalCruiseFinDelayField = AccessTools.Field(typeof(OpticalSeekerCruiseMissile), "finDelay");

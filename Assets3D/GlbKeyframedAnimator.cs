@@ -129,14 +129,12 @@ namespace MDSFramework.Assets3D
             if (moving)
             {
                 currentTime = Mathf.MoveTowards(currentTime, goalTime, deltaTime * playbackRate);
-                bool suppressTurret = allowTurretOverrides || (targetDeployed && NormalizedProgress >= 0.995f);
-                SampleClipAtTime(currentTime, suppressTurretOverrides: suppressTurret);
+                SampleClipAtTime(currentTime, suppressTurretOverrides: allowTurretOverrides);
                 lastSampleApplied = true;
             }
             else if (!lastSampleApplied)
             {
-                bool suppressTurret = allowTurretOverrides || (targetDeployed && NormalizedProgress >= 0.995f);
-                SampleClipAtTime(currentTime, suppressTurretOverrides: suppressTurret);
+                SampleClipAtTime(currentTime, suppressTurretOverrides: allowTurretOverrides);
                 lastSampleApplied = true;
             }
         }

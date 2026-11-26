@@ -87,7 +87,9 @@ namespace MDSFramework.Deployment
 
                 if (isVehicle)
                 {
-                    spawnedUnit = Spawner.i.SpawnVehicle(basePrefab, gPos, rot, Vector3.zero, hq!, siteId, 1f, holdPosition: false, null!);
+                    float vehicleSpawnY = (customDef != null && customDef.spawnOffset.y > 0.01f) ? customDef.spawnOffset.y : 0.954f;
+                    GlobalPosition vehPos = GameInteropHelpers.WorldToGlobal(groundedPos + (Vector3.up * vehicleSpawnY));
+                    spawnedUnit = Spawner.i.SpawnVehicle(basePrefab, vehPos, rot, Vector3.zero, hq!, siteId, 1f, holdPosition: false, null!);
                 }
                 else if (isBuilding)
                 {
@@ -157,7 +159,11 @@ namespace MDSFramework.Deployment
             if (spec.IsMobileVehicle && targetRoot.TryGetComponent(out GroundVehicle gv))
             {
                 targetBottomY = -0.954f;
-                if (GameInteropHelpers.GroundVehicleWheelsField?.GetValue(gv) is GameObject[] vanillaWheels &&
+                if (gv.definition != null && gv.definition.spawnOffset.y > 0.1f)
+                {
+                    targetBottomY = -gv.definition.spawnOffset.y;
+                }
+                else if (GameInteropHelpers.GroundVehicleWheelsField?.GetValue(gv) is GameObject[] vanillaWheels &&
                     vanillaWheels.Length > 0 &&
                     vanillaWheels[0] != null)
                 {
@@ -564,6 +570,21 @@ namespace MDSFramework.Deployment
         {
             HideVanillaRenderers(unit.gameObject, preserveCargoChute: true);
             DisableVanillaAutoWeapons(unit.gameObject, spec.Role);
+
+            // Cloned HLT-L templates carry a vanilla Rearmer component; remove it so MDS trucks don't act as ammo trucks.
+            Rearmer[] strayRearmers = unit.GetComponentsInChildren<Rearmer>(true);
+            for (int i = 0; i < strayRearmers.Length; i++)
+            {
+                Rearmer stray = strayRearmers[i];
+                if (stray == null)
+                {
+                    continue;
+                }
+
+                stray.enabled = false;
+                unit.NetworkHQ?.RearmMissionController?.DeregisterRearmer(stray);
+                UnityEngine.Object.Destroy(stray);
+            }
         }
 
         private static void HideVanillaRenderers(GameObject root, bool preserveCargoChute)

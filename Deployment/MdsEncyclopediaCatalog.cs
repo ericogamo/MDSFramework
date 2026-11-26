@@ -431,9 +431,12 @@ namespace MDSFramework.Deployment
             clonedDef.unitName = $"[MDS] {spec.DisplayName}";
             clonedDef.code = BuildShortCode(spec);
             clonedDef.description = BuildUnitDescription(pkg, spec);
-            clonedDef.value = Mathf.Max(1f, spec.Logistics?.CreditCost ?? 100f);
+            clonedDef.value = Mathf.Max(0.05f, spec.Logistics?.CreditCost ?? 100f);
             clonedDef.radarSize = Mathf.Max(0.05f, spec.StowedRcs);
-            clonedDef.spawnOffset = Vector3.zero;
+            if (!(clonedDef is VehicleDefinition))
+            {
+                clonedDef.spawnOffset = Vector3.zero;
+            }
             clonedDef.dontAutomaticallyAddToEncyclopedia = false;
 
             if (clonedDef is VehicleDefinition && spec.IsContainerHauler)
