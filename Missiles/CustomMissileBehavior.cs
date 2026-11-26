@@ -99,6 +99,16 @@ namespace MDSFramework.Missiles
         private int chosenFlankSign;
         private float nextLiveAaCheckTime;
 
+        // Air-drop free-fall separation -> unpowered aerodynamic glide -> 10 ft sea-skim ignition (JSM)
+        private bool airDropGlideActive;
+        private bool airDropMotorIgnited;
+        private float airDropGlideStartSpeed;
+        private FieldInfo? motorDelayTimerField;
+        private FieldInfo? motorStartupSourceField;
+        private AudioSource? cachedStartupAudio;
+        private float cachedStartupAudioVol = 1f;
+        private bool startupAudioMuted;
+
         private readonly struct AaThreatBubble
         {
             internal readonly Vector3 Pos;
@@ -145,7 +155,8 @@ namespace MDSFramework.Missiles
             Unit? targetUnit,
             FactionAffinity ownerFaction,
             bool startPassiveHoj,
-            bool verticalLaunch = false)
+            bool verticalLaunch = false,
+            bool isAirDropped = false)
         {
             Package = package;
             Spec = spec;
@@ -184,7 +195,31 @@ namespace MDSFramework.Missiles
             ExtendMotorForSpecRange();
             AttachCustomVisualRig();
 
-            if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
+            if (isAirDropped &&
+                spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive)
+            {
+                float seaY = Datum.LocalSeaY;
+                float groundY = Mathf.Max(seaY, SampleTerrainY(missile.transform.position.x, missile.transform.position.z, seaY));
+                float startClearance = missile.transform.position.y - groundY;
+                airDropGlideActive = true;
+                airDropMotorIgnited = false;
+                airDropGlideStartSpeed = Mathf.Max(
+                    95f,
+                    missile.rb != null
+                        ? missile.rb.velocity.magnitude
+                        : (missile.startingVelocity.magnitude > 1f ? missile.startingVelocity.magnitude : 210f));
+                HoldFirstMotorDelay(0.45f, muteStartupAudio: true);
+
+                if (!missile.remoteSim && targetUnit != null && !targetUnit.disabled)
+                {
+                    PrecomputeSeaWraithRoute(missile.transform.position, targetUnit.transform.position);
+                    if (startClearance <= 35f)
+                    {
+                        AdjustLaunchPitchForImmediateTerrain(missile.transform.position);
+                    }
+                }
+            }
+            else if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
                 !missile.remoteSim &&
                 targetUnit != null &&
                 !targetUnit.disabled)
@@ -235,6 +270,16 @@ namespace MDSFramework.Missiles
             Spec = spec;
             Missile = missile;
             AttachCustomVisualRig();
+
+            if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
+                ((missile.ownerID.IsValid && missile.ownerID.TryGetUnit(out Unit ownerUnit) && ownerUnit is Aircraft) ||
+                 (missile.transform.position.y - Datum.LocalSeaY) > 35f))
+            {
+                airDropGlideActive = true;
+                airDropMotorIgnited = false;
+                HoldFirstMotorDelay(0.45f, muteStartupAudio: true);
+            }
+
             prevVisualPos = missile.transform.position;
             hasPrevVisualPos = true;
             CustomMissileTracker.Register(this);
@@ -502,6 +547,21 @@ namespace MDSFramework.Missiles
 
             if (Missile.remoteSim)
             {
+                if (airDropGlideActive && !airDropMotorIgnited)
+                {
+                    float clientHeight = Missile.transform.position.y - Datum.LocalSeaY;
+                    if (ageSeconds >= 0.85f && (clientHeight <= 24f || ageSeconds >= 18f))
+                    {
+                        airDropMotorIgnited = true;
+                        airDropGlideActive = false;
+                        ReleaseFirstMotorDelay();
+                    }
+                    else
+                    {
+                        HoldFirstMotorDelay(0.25f, muteStartupAudio: true);
+                    }
+                }
+
                 UpdateFlightControlSurfaceAnimation(dt);
                 return;
             }
@@ -515,20 +575,27 @@ namespace MDSFramework.Missiles
                 PulseActiveDirectionalJammer();
             }
 
-            float climbDuration = Spec.IsAntiShip
-                ? (Spec.BoosterDropSeconds > 0f ? 1.55f : 0.95f)
-                : (launchedVertically ? 0.80f : 0.45f);
-            if (ageSeconds < climbDuration)
+            if (airDropGlideActive && !airDropMotorIgnited)
             {
-                Missile.SetAimpoint(
-                    GameInteropHelpers.WorldToGlobal(Missile.transform.position + (initialLaunchDir * 3000f)),
-                    Vector3.zero);
+                UpdateAirDropGlideState(dt);
             }
             else
             {
-                UpdateActivePassiveHoj(dt);
-                UpdateActiveTargetDatalink();
-                UpdateFlightProfileGuidance(dt);
+                float climbDuration = Spec.IsAntiShip
+                    ? (Spec.BoosterDropSeconds > 0f ? 1.55f : 0.95f)
+                    : (launchedVertically ? 0.80f : 0.45f);
+                if (!airDropMotorIgnited && ageSeconds < climbDuration)
+                {
+                    Missile.SetAimpoint(
+                        GameInteropHelpers.WorldToGlobal(Missile.transform.position + (initialLaunchDir * 3000f)),
+                        Vector3.zero);
+                }
+                else
+                {
+                    UpdateActivePassiveHoj(dt);
+                    UpdateActiveTargetDatalink();
+                    UpdateFlightProfileGuidance(dt);
+                }
             }
 
             EnforceSpeedLimit(dt);
@@ -549,6 +616,226 @@ namespace MDSFramework.Missiles
             {
                 hasPrevPositions = false;
             }
+        }
+
+        private void EnsureMotorReflectionFields(Type motorType)
+        {
+            motorDelayTimerField ??= motorType.GetField("delayTimer", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            motorStartupSourceField ??= motorType.GetField("startupSource", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        }
+
+        private void HoldFirstMotorDelay(float holdSeconds, bool muteStartupAudio)
+        {
+            try
+            {
+                if (GameInteropHelpers.MissileMotorsField?.GetValue(Missile) is not Array motors || motors.Length == 0)
+                {
+                    return;
+                }
+
+                object? firstMotor = motors.GetValue(0);
+                if (firstMotor == null)
+                {
+                    return;
+                }
+
+                EnsureMotorReflectionFields(firstMotor.GetType());
+                motorDelayTimerField?.SetValue(firstMotor, holdSeconds);
+
+                if (muteStartupAudio && motorStartupSourceField?.GetValue(firstMotor) is AudioSource src && src != null)
+                {
+                    if (!startupAudioMuted)
+                    {
+                        cachedStartupAudio = src;
+                        cachedStartupAudioVol = src.volume;
+                        startupAudioMuted = true;
+                    }
+
+                    src.volume = 0f;
+                    if (src.isPlaying)
+                    {
+                        src.Stop();
+                    }
+                }
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+
+        private void ReleaseFirstMotorDelay()
+        {
+            try
+            {
+                if (startupAudioMuted && cachedStartupAudio != null)
+                {
+                    cachedStartupAudio.volume = cachedStartupAudioVol;
+                }
+
+                startupAudioMuted = false;
+
+                if (GameInteropHelpers.MissileMotorsField?.GetValue(Missile) is not Array motors || motors.Length == 0)
+                {
+                    return;
+                }
+
+                object? firstMotor = motors.GetValue(0);
+                if (firstMotor == null)
+                {
+                    return;
+                }
+
+                EnsureMotorReflectionFields(firstMotor.GetType());
+                motorDelayTimerField?.SetValue(firstMotor, 0f);
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+
+        private void UpdateAirDropGlideState(float dt)
+        {
+            Vector3 myPos = Missile.transform.position;
+            float seaY = Datum.LocalSeaY;
+            float seaSkimFloor = seaY + Mathf.Max(2.6f, Spec.SeaSkimAltitudeMeters);
+            float localTerrainY = SampleTerrainY(myPos.x, myPos.z, seaY);
+            float localFloorY = localTerrainY > seaY + 0.5f
+                ? localTerrainY + LandTreeClearanceMeters
+                : seaSkimFloor;
+
+            float heightAboveFloor = myPos.y - localFloorY;
+            float currentSpeed = Missile.rb != null ? Missile.rb.velocity.magnitude : airDropGlideStartSpeed;
+            float distToTarget = TargetUnit != null && !TargetUnit.disabled
+                ? Vector3.Distance(myPos, TargetUnit.transform.position)
+                : float.MaxValue;
+
+            bool shouldIgnite = ageSeconds >= 0.85f &&
+                                (heightAboveFloor <= 24f ||
+                                 currentSpeed <= 165f ||
+                                 distToTarget <= 2400f ||
+                                 ageSeconds >= 38f);
+
+            if (shouldIgnite)
+            {
+                airDropMotorIgnited = true;
+                airDropGlideActive = false;
+                ReleaseFirstMotorDelay();
+                UpdateActivePassiveHoj(dt);
+                UpdateActiveTargetDatalink();
+                UpdateFlightProfileGuidance(dt);
+                return;
+            }
+
+            HoldFirstMotorDelay(0.25f, muteStartupAudio: true);
+            UpdateActiveTargetDatalink();
+
+            if (ageSeconds < 0.85f)
+            {
+                // Clean unpowered free-fall separation away from the launching aircraft before wing glide starts.
+                Vector3 dropAim = myPos + (initialLaunchDir * 2500f) + (Vector3.down * 350f);
+                Missile.SetAimpoint(GameInteropHelpers.WorldToGlobal(dropAim), Vector3.zero);
+                return;
+            }
+
+            SteerAirDropGlide(dt, myPos, seaY, localFloorY, currentSpeed);
+        }
+
+        private void SteerAirDropGlide(float dt, Vector3 myPos, float seaY, float localFloorY, float currentSpeed)
+        {
+            if (Missile.rb == null)
+            {
+                return;
+            }
+
+            Vector3 horizAim = myPos + (initialLaunchDir * 3000f);
+            float targetTerrainAheadY = localFloorY;
+
+            if (TargetUnit != null && !TargetUnit.disabled)
+            {
+                Vector3 targetPos = TargetUnit.transform.position;
+                Vector3 targetVel = TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
+                float dist = Vector3.Distance(myPos, targetPos);
+                float tti = Mathf.Clamp(dist / Mathf.Max(180f, currentSpeed), 0.05f, 8.0f);
+                Vector3 routeAim = targetPos + (targetVel * (tti * 0.75f));
+                UpdateSeaSkimmingEvasiveProfile(myPos, targetPos, targetVel, dist, tti, dt, ref routeAim);
+                horizAim = routeAim;
+                targetTerrainAheadY = Mathf.Max(localFloorY, routeAim.y);
+            }
+
+            Vector3 flatDelta = new Vector3(horizAim.x - myPos.x, 0f, horizAim.z - myPos.z);
+            float flatDist = flatDelta.magnitude;
+            Vector3 flatDir = flatDist > 1f
+                ? flatDelta / flatDist
+                : new Vector3(initialLaunchDir.x, 0f, initialLaunchDir.z).normalized;
+            if (flatDir.sqrMagnitude < 0.01f)
+            {
+                flatDir = Vector3.forward;
+            }
+
+            float seaSkimFloor = seaY + Mathf.Max(2.6f, Spec.SeaSkimAltitudeMeters);
+            float glideHeight = myPos.y - targetTerrainAheadY;
+
+            // Smooth aerodynamic glide descent toward 10 ft sea-skim (up to -13 deg above high altitude, flaring near surface, or +10 deg if hill ahead).
+            float desiredPitchDeg;
+            if (glideHeight < -2f)
+            {
+                desiredPitchDeg = Mathf.Clamp((-glideHeight / 32f) * 10f, 1.5f, 10f);
+            }
+            else if (glideHeight <= 65f)
+            {
+                desiredPitchDeg = -Mathf.Lerp(0.5f, 6.5f, Mathf.Clamp01(glideHeight / 65f));
+            }
+            else
+            {
+                desiredPitchDeg = -Mathf.Lerp(6.5f, 13.0f, Mathf.Clamp01((glideHeight - 65f) / 380f));
+            }
+
+            float pitchRad = desiredPitchDeg * Mathf.Deg2Rad;
+            Vector3 desiredDir = ((flatDir * Mathf.Cos(pitchRad)) + (Vector3.up * Mathf.Sin(pitchRad))).normalized;
+
+            if (Time.time - lastProfileAimUpdate >= 0.12f)
+            {
+                lastProfileAimUpdate = Time.time;
+                Missile.SetAimpoint(GameInteropHelpers.WorldToGlobal(myPos + (desiredDir * 2400f)), Vector3.zero);
+            }
+
+            Vector3 vel = Missile.rb.velocity;
+            float speed = vel.magnitude;
+            if (speed < 35f)
+            {
+                return;
+            }
+
+            Vector3 prevDir = vel / speed;
+            float turnRate = emergencyPullUpThisTick ? 3.2f : 1.05f;
+            Vector3 newDir = Vector3.RotateTowards(prevDir, desiredDir, dt * turnRate, 0f);
+
+            float aheadTerrainY = SampleTerrainY(myPos.x + (newDir.x * 160f), myPos.z + (newDir.z * 160f), seaY);
+            float safeFloorY = aheadTerrainY > seaY + 0.5f ? aheadTerrainY + LandTreeClearanceMeters : seaSkimFloor;
+            Vector3 nextCheckPos = myPos + (newDir * (speed * Mathf.Max(dt, 0.25f)));
+            if (nextCheckPos.y < safeFloorY)
+            {
+                float neededDy = Mathf.Clamp((safeFloorY - myPos.y) / Mathf.Max(45f, speed * 0.65f), 0.02f, 0.45f);
+                newDir.y = Mathf.Max(neededDy, newDir.y);
+                newDir.Normalize();
+            }
+
+            float sinFlight = Mathf.Clamp(newDir.y, -0.5f, 0.5f);
+            float glideAccel = (-Physics.gravity.magnitude * sinFlight) - (speed * speed * 0.00018f);
+            float nextSpeed = Mathf.Clamp(speed + (glideAccel * dt), 162f, Mathf.Max(airDropGlideStartSpeed, 295f));
+
+            Vector3 prevFlat = new Vector3(prevDir.x, 0f, prevDir.z);
+            Vector3 newFlat = new Vector3(newDir.x, 0f, newDir.z);
+            float signedYawRateDeg = (prevFlat.sqrMagnitude > 0.001f && newFlat.sqrMagnitude > 0.001f && dt > 0.0001f)
+                ? Vector3.SignedAngle(prevFlat.normalized, newFlat.normalized, Vector3.up) / dt
+                : 0f;
+            float targetBankDeg = Mathf.Clamp(signedYawRateDeg * 1.15f, -40f, 40f);
+            currentBankDeg = Mathf.Lerp(currentBankDeg, targetBankDeg, 1f - Mathf.Exp(-dt * 6.0f));
+
+            Missile.rb.velocity = newDir * nextSpeed;
+            Missile.rb.MoveRotation(Quaternion.LookRotation(newDir, Vector3.up) * Quaternion.Euler(0f, 0f, currentBankDeg * bankRollSign));
         }
 
         private void EnforceSpeedLimit(float dt)
@@ -609,6 +896,11 @@ namespace MDSFramework.Missiles
             if (ageSeconds >= maxFlightLifetimeSeconds)
             {
                 return false;
+            }
+
+            if (airDropGlideActive)
+            {
+                return true;
             }
 
             if (TargetUnit != null && !TargetUnit.disabled)

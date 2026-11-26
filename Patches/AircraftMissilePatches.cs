@@ -244,7 +244,8 @@ namespace MDSFramework.Patches
                     target,
                     ownerAffinity,
                     startPassiveHoj: false,
-                    verticalLaunch: false);
+                    verticalLaunch: false,
+                    isAirDropped: owner is Aircraft);
             }
         }
 
