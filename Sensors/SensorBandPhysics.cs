@@ -26,6 +26,42 @@ namespace MDSFramework.Sensors
             return (mask & (1 << (int)band)) != 0;
         }
 
+        internal static bool CanSiteSense(ModularSiteBehavior? site)
+        {
+            return site != null &&
+                   site.IsAlive &&
+                   !site.SuspendedInTransit &&
+                   site.IsDeployed;
+        }
+
+        internal static float ComputeEffectiveDetectionRangeMeters(
+            ModularSiteBehavior? site,
+            float targetRcs,
+            float targetSpeedMps,
+            bool targetEmitsRadar,
+            bool targetIsJamming,
+            out SensorBand bestBand,
+            out float trackQuality)
+        {
+            if (!CanSiteSense(site) || site!.Spec.SensorProfile == null)
+            {
+                bestBand = SensorBand.EoIr;
+                trackQuality = 0f;
+                return 0f;
+            }
+
+            return ComputeEffectiveDetectionRangeMeters(
+                site.Spec.SensorProfile,
+                site.IsRadarEmitting,
+                targetRcs,
+                targetSpeedMps,
+                targetEmitsRadar,
+                targetIsJamming,
+                site.CurrentJamLevel,
+                out bestBand,
+                out trackQuality);
+        }
+
         internal static float ComputeEffectiveDetectionRangeMeters(
             EccmSensorProfile profile,
             bool radarEmitting,

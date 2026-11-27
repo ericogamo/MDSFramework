@@ -208,6 +208,7 @@ namespace MDSFramework.Patches
             }
 
             fallbackLoopClip = AudioClip.Create("mds_eccm_rwr_loop_fallback", totalSamples, 1, sampleRate, stream: false);
+            fallbackLoopClip.hideFlags = HideFlags.DontUnloadUnusedAsset;
             fallbackLoopClip.SetData(samples, 0);
             return fallbackLoopClip;
         }
@@ -259,6 +260,7 @@ namespace MDSFramework.Patches
             }
 
             fallbackAlertClip = AudioClip.Create("mds_eccm_rwr_alert_fallback", totalSamples, 1, sampleRate, stream: false);
+            fallbackAlertClip.hideFlags = HideFlags.DontUnloadUnusedAsset;
             fallbackAlertClip.SetData(samples, 0);
             return fallbackAlertClip;
         }

@@ -5,37 +5,65 @@ using UnityEngine;
 
 namespace MDSFramework.Patches
 {
+    internal static class SeekerSelfDestructScope
+    {
+        [ThreadStatic]
+        private static int depth;
+
+        internal static bool IsActive => depth > 0;
+
+        internal static void Enter()
+        {
+            depth++;
+        }
+
+        internal static void Exit()
+        {
+            if (depth > 0)
+            {
+                depth--;
+            }
+        }
+    }
+
     [HarmonyPatch(
         typeof(Missile),
         nameof(Missile.TakeDamage),
         new[] { typeof(float), typeof(float), typeof(float), typeof(float), typeof(float), typeof(PersistentID) })]
     internal static class CustomMissileTakeDamageScopePatch
     {
-        [ThreadStatic]
-        private static int takeDamageDepth;
-
-        internal static bool IsInsideTakeDamage => takeDamageDepth > 0;
-
-        private static bool Prefix(out bool __state)
+        private static bool Prefix()
         {
-            if (!GameInteropHelpers.IsServerAuthority())
-            {
-                __state = false;
-                return false;
-            }
-
-            takeDamageDepth++;
-            __state = true;
-            return true;
+            return GameInteropHelpers.IsServerAuthority();
         }
+    }
 
-        private static void Finalizer(bool __state)
-        {
-            if (__state && takeDamageDepth > 0)
-            {
-                takeDamageDepth--;
-            }
-        }
+    [HarmonyPatch(typeof(OpticalSeekerCruiseMissile), "SlowChecks")]
+    internal static class OpticalSeekerSlowChecksSelfDestructScopePatch
+    {
+        private static void Prefix() => SeekerSelfDestructScope.Enter();
+        private static void Finalizer() => SeekerSelfDestructScope.Exit();
+    }
+
+    [HarmonyPatch(typeof(OpticalSeekerCruiseMissile), nameof(OpticalSeekerCruiseMissile.PreTerminalMode))]
+    internal static class OpticalSeekerPreTerminalSelfDestructScopePatch
+    {
+        private static void Prefix() => SeekerSelfDestructScope.Enter();
+        private static void Finalizer() => SeekerSelfDestructScope.Exit();
+    }
+
+    [HarmonyPatch(typeof(OpticalSeekerCruiseMissile), nameof(OpticalSeekerCruiseMissile.TerminalMode))]
+    internal static class OpticalSeekerTerminalSelfDestructScopePatch
+    {
+        private static void Prefix() => SeekerSelfDestructScope.Enter();
+        private static void Finalizer() => SeekerSelfDestructScope.Exit();
+    }
+
+    [HarmonyPatch(typeof(BallisticMissileGuidance), "SlowChecks")]
+    internal static class BallisticSlowChecksSelfDestructScopePatch
+    {
+        private static void Prefix() => SeekerSelfDestructScope.Enter();
+        private static void Finalizer() => SeekerSelfDestructScope.Exit();
     }
 
     [HarmonyPatch(typeof(Missile), nameof(Missile.Detonate), new[] { typeof(Vector3), typeof(bool), typeof(bool) })]
@@ -43,7 +71,7 @@ namespace MDSFramework.Patches
     {
         private static bool Prefix(Missile __instance, bool hitArmor, bool hitTerrain)
         {
-            if (CustomMissileTakeDamageScopePatch.IsInsideTakeDamage)
+            if (!SeekerSelfDestructScope.IsActive)
             {
                 return true;
             }
@@ -62,12 +90,19 @@ namespace MDSFramework.Patches
     [HarmonyPatch(typeof(ARHSeeker), "ARHSeeker_OnJam")]
     internal static class ArhSeekerOnJamPatch
     {
-        private static bool Prefix(ARHSeeker __instance, Unit.JamEventArgs e, out bool __state)
+        private struct JamState
         {
-            __state = false;
+            internal bool CheckHojPost;
+            internal bool RestoreHomeOnJam;
+            internal bool OriginalHomeOnJam;
+        }
+
+        private static bool Prefix(ARHSeeker __instance, Unit.JamEventArgs e, out JamState __state)
+        {
+            __state = default;
             if (!GameInteropHelpers.IsServerAuthority() || __instance == null)
             {
-                return true;
+                return false;
             }
 
             Missile? missile = GameInteropHelpers.SeekerMissileField?.GetValue(__instance) as Missile;
@@ -82,19 +117,32 @@ namespace MDSFramework.Patches
             }
 
             if (e.jammingUnit == null || e.jammingUnit.disabled ||
-                (custom.Spec.IsAntiShip && e.jammingUnit is not Ship) ||
                 !GameInteropHelpers.IsHostileToAffinity(e.jammingUnit, custom.OwnerFaction, missile.NetworkHQ ?? missile.MapHQ))
             {
                 return false;
             }
 
-            __state = true;
+            // Anti-ship HoJ missiles still accumulate jamming from aircraft/ground jammers,
+            // but must not switch target lock onto a non-Ship jammer.
+            if (custom.Spec.IsAntiShip && e.jammingUnit is not Ship)
+            {
+                if (GameInteropHelpers.ArhHomeOnJamField?.GetValue(__instance) is bool hoj && hoj)
+                {
+                    __state.RestoreHomeOnJam = true;
+                    __state.OriginalHomeOnJam = hoj;
+                    GameInteropHelpers.ArhHomeOnJamField.SetValue(__instance, false);
+                }
+
+                return true;
+            }
+
+            __state.CheckHojPost = true;
             return true;
         }
 
-        private static void Postfix(ARHSeeker __instance, bool __state)
+        private static void Postfix(ARHSeeker __instance, JamState __state)
         {
-            if (!__state || __instance == null)
+            if (!__state.CheckHojPost || __instance == null)
             {
                 return;
             }
@@ -111,6 +159,14 @@ namespace MDSFramework.Patches
             {
                 custom.PassiveHojActive = true;
                 missile.NetworkseekerMode = Missile.SeekerMode.passive;
+            }
+        }
+
+        private static void Finalizer(ARHSeeker __instance, JamState __state)
+        {
+            if (__state.RestoreHomeOnJam && __instance != null)
+            {
+                GameInteropHelpers.ArhHomeOnJamField?.SetValue(__instance, __state.OriginalHomeOnJam);
             }
         }
     }
@@ -149,8 +205,9 @@ namespace MDSFramework.Patches
     [HarmonyPatch(typeof(ARHSeeker), "SlowChecks")]
     internal static class ArhSeekerSlowChecksBlindGuardPatch
     {
-        private static bool Prefix(ARHSeeker __instance)
+        private static bool Prefix(ARHSeeker __instance, out bool __state)
         {
+            __state = false;
             if (__instance == null)
             {
                 return true;
@@ -168,6 +225,8 @@ namespace MDSFramework.Patches
                                   missile.NetworkHQ.GetTrackingData(targetUnit.persistentID) == null;
             if (!custom.PassiveHojActive && !unTrackedBlind)
             {
+                SeekerSelfDestructScope.Enter();
+                __state = true;
                 return true;
             }
 
@@ -219,6 +278,14 @@ namespace MDSFramework.Patches
             }
 
             return false;
+        }
+
+        private static void Finalizer(bool __state)
+        {
+            if (__state)
+            {
+                SeekerSelfDestructScope.Exit();
+            }
         }
     }
 }

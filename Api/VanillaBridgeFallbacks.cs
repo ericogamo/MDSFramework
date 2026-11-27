@@ -197,6 +197,12 @@ namespace MDSFramework.Api
                 }
             }
 
+            internal void RefundAbmInterceptor(FactionAffinity faction, string? missileId)
+            {
+                _ = missileId;
+                RefundAbmInterceptor(faction);
+            }
+
             internal void RaiseBallisticThreatDetected(FactionAffinity targetFaction, Vector3 originPos, float blastYield)
             {
                 OnBallisticThreatDetected?.Invoke(targetFaction, originPos, blastYield);

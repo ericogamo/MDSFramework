@@ -35,14 +35,16 @@ namespace MDSFramework.Assets3D
                     return cached;
                 }
 
+                if (ReferenceEquals(cached, null))
+                {
+                    return null;
+                }
+
                 Cache.Remove(normalized);
             }
 
             AudioClip? clip = LoadFromDisk(normalized);
-            if (clip != null)
-            {
-                Cache[normalized] = clip;
-            }
+            Cache[normalized] = clip;
 
             return clip;
         }
@@ -185,6 +187,11 @@ namespace MDSFramework.Assets3D
                     for (int i = 0; i < totalFloats; i++)
                     {
                         float f = BitConverter.ToSingle(bytes, dataOffset + (i * 4));
+                        if (float.IsNaN(f) || float.IsInfinity(f))
+                        {
+                            f = 0f;
+                        }
+
                         samples[i] = Mathf.Clamp(f, -1f, 1f);
                     }
                 }
@@ -196,6 +203,7 @@ namespace MDSFramework.Assets3D
 
                 string clipName = Path.GetFileNameWithoutExtension(fullPath);
                 AudioClip clip = AudioClip.Create(clipName, sampleFrames, channels, sampleRate, stream: false);
+                clip.hideFlags = HideFlags.DontUnloadUnusedAsset;
                 clip.SetData(samples, 0);
                 return clip;
             }

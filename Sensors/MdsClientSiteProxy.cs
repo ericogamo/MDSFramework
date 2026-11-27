@@ -41,7 +41,14 @@ namespace MDSFramework.Sensors
         private int activeFcuCount;
         private int effectorCount;
         private int commandNetId;
-        private bool containerLandedApplied;
+        private bool containerCleanupApplied;
+        private bool hasAppliedLandedPose;
+        private float lastLandedYawDeg;
+        private bool lastSyncedRadarEmitting;
+        private Radar? nativeRadar;
+        private TargetDetector? nativeDetector;
+
+        internal float EffectiveNetworkEccmBonus { get; private set; }
 
         public bool IsDeployed => !isVehicleMoving && (Animator == null || Animator.IsFullyDeployed);
         public bool IsRadarEmitting => radarEmitting && !suspendedInTransit && Unit != null && !Unit.disabled;
@@ -124,6 +131,14 @@ namespace MDSFramework.Sensors
                 registeredPid = unit.persistentID.Id;
                 ByPersistentId[registeredPid] = this;
             }
+
+            if (unit != null)
+            {
+                nativeRadar = unit.GetComponentInChildren<Radar>(true);
+                nativeDetector = unit.radar != null ? unit.radar : unit.GetComponentInChildren<TargetDetector>(true);
+                ApplyBaselineNativeSensorProfile();
+                SyncNativeRadarState();
+            }
         }
 
         public bool TryGetCargoDeckLocalOffset(out Vector3 localOffset)
@@ -153,13 +168,18 @@ namespace MDSFramework.Sensors
             int fcuCnt,
             int activeFcuCnt,
             int effCnt,
-            int netId)
+            int netId,
+            bool isLandedContainer = false,
+            float containerYawDeg = 0f,
+            float containerLengthMeters = 0f,
+            float networkEccmBonus = 0f)
         {
             if (Unit == null)
             {
                 return;
             }
 
+            bool prevHoldFire = holdFire;
             bool deployDesired = (flags & (1 << 0)) != 0;
             radarEmitting = (flags & (1 << 1)) != 0;
             holdFire = (flags & (1 << 2)) != 0;
@@ -169,13 +189,26 @@ namespace MDSFramework.Sensors
             isVehicleMoving = (flags & (1 << 6)) != 0;
             bool animTarget = (flags & (1 << 7)) != 0;
 
+            if (suspendedInTransit)
+            {
+                hasAppliedLandedPose = false;
+            }
+
             targetDeployed = deployDesired || animTarget;
             fcuCount = fcuCnt;
             activeFcuCount = activeFcuCnt;
             effectorCount = effCnt;
             commandNetId = netId;
+            EffectiveNetworkEccmBonus = Mathf.Clamp01(networkEccmBonus);
 
             Unit.RCS = Mathf.Max(0.02f, rcs);
+            ApplyBaselineNativeSensorProfile();
+            SyncNativeRadarState();
+
+            if (!hasReceivedSnapshot || prevHoldFire != holdFire)
+            {
+                RtsBridgeHost.SyncMdsSiteHoldFireToRts?.Invoke(Unit, holdFire);
+            }
 
             if (Animator != null)
             {
@@ -187,9 +220,13 @@ namespace MDSFramework.Sensors
                 Animator.SetTargetDeployed(animTarget);
             }
 
-            if (TurretAim != null && !holdFire && !suspendedInTransit && targetDeployed)
+            if (TurretAim != null && !suspendedInTransit && targetDeployed)
             {
                 TurretAim.SetReplicatedAngles(yawDeg, pitchDeg);
+                if (holdFire)
+                {
+                    TurretAim.HideBeam();
+                }
             }
             else
             {
@@ -212,42 +249,105 @@ namespace MDSFramework.Sensors
                 }
             }
 
+            if (isLandedContainer && !suspendedInTransit && Unit is Container)
+            {
+                float len = containerLengthMeters > 0.5f ? containerLengthMeters : Spec.ContainerLengthMeters;
+                ApplyContainerLanded(containerYawDeg, len);
+            }
+
             hasReceivedSnapshot = true;
         }
 
         internal void ApplyContainerLanded(float yawDeg, float lengthMeters)
         {
-            if (Unit == null || containerLandedApplied)
+            if (Unit == null)
             {
                 return;
             }
 
-            containerLandedApplied = true;
-            CargoDeploymentSystem[] crates = Unit.GetComponentsInChildren<CargoDeploymentSystem>(true);
-            for (int i = 0; i < crates.Length; i++)
+            if (!containerCleanupApplied)
             {
-                if (crates[i] != null && crates[i].gameObject != Unit.gameObject)
+                containerCleanupApplied = true;
+                CargoDeploymentSystem[] crates = Unit.GetComponentsInChildren<CargoDeploymentSystem>(true);
+                for (int i = 0; i < crates.Length; i++)
                 {
-                    Destroy(crates[i].gameObject);
+                    if (crates[i] != null && crates[i].gameObject != Unit.gameObject)
+                    {
+                        Destroy(crates[i].gameObject);
+                    }
+                }
+
+                ModularSiteManager.RemoveVanillaRearmer(Unit, Spec);
+                ModularSiteManager.DisableVanillaAutoWeapons(Unit.gameObject, Spec.Role);
+
+                if (Unit is Container container && lengthMeters > 6.5f)
+                {
+                    BoxCollider? box = container.GetComponent<BoxCollider>();
+                    if (box != null)
+                    {
+                        float oldBottomY = box.center.y - (box.size.y * 0.5f);
+                        float width = Mathf.Max(2.438f, Spec.ContainerWidthMeters);
+                        float height = Mathf.Max(2.591f, Spec.ContainerHeightMeters);
+                        float length = Mathf.Max(6.058f, lengthMeters);
+                        box.size = new Vector3(width, height, length);
+                        box.center = new Vector3(box.center.x, oldBottomY + (height * 0.5f), box.center.z);
+                    }
                 }
             }
 
-            ModularSiteManager.RemoveVanillaRearmer(Unit, Spec);
-            ModularSiteManager.DisableVanillaAutoWeapons(Unit.gameObject, Spec.Role);
-
-            if (Unit is Container container && lengthMeters > 6.5f)
+            Quaternion targetRot = Quaternion.Euler(0f, yawDeg, 0f);
+            if (!hasAppliedLandedPose ||
+                Mathf.Abs(Mathf.DeltaAngle(lastLandedYawDeg, yawDeg)) > 0.25f ||
+                Quaternion.Angle(Unit.transform.rotation, targetRot) > 0.5f)
             {
-                BoxCollider? box = container.GetComponent<BoxCollider>();
-                if (box != null)
-                {
-                    float width = Mathf.Max(2.2f, Spec.ContainerWidthMeters);
-                    float height = Mathf.Max(2.2f, Spec.ContainerHeightMeters);
-                    box.size = new Vector3(width, height, lengthMeters);
-                }
+                Unit.transform.rotation = targetRot;
+                Physics.SyncTransforms();
+                lastLandedYawDeg = yawDeg;
+                hasAppliedLandedPose = true;
+            }
+        }
+
+        private void ApplyBaselineNativeSensorProfile()
+        {
+            if (Spec == null || Spec.SensorProfile == null || nativeRadar == null)
+            {
+                return;
             }
 
-            Unit.transform.rotation = Quaternion.Euler(0f, yawDeg, 0f);
-            Physics.SyncTransforms();
+            if (GameInteropHelpers.RadarJamToleranceField != null)
+            {
+                float boostedTol = Mathf.Clamp(Spec.SensorProfile.JamTolerance + EffectiveNetworkEccmBonus, 0f, 0.92f);
+                GameInteropHelpers.RadarJamToleranceField.SetValue(nativeRadar, boostedTol);
+            }
+        }
+
+        private void SyncNativeRadarState()
+        {
+            if (Unit == null || Spec == null)
+            {
+                return;
+            }
+
+            bool isTrueRadarSite = Spec.SensorProfile != null &&
+                                   (Spec.SensorProfile.IsFireControlUnit || Spec.Role == WeaponCascadeRole.EarlyWarningRadar);
+            bool activeNow = IsRadarEmitting;
+            lastSyncedRadarEmitting = activeNow;
+
+            if (nativeRadar != null)
+            {
+                nativeRadar.activated = isTrueRadarSite && activeNow;
+            }
+            else if (nativeDetector != null)
+            {
+                nativeDetector.activated = activeNow || (IsDeployed && Spec.SensorProfile != null && Spec.SensorProfile.EoIrEmergencyRangeKm > 0f);
+            }
+
+            if (Unit.radar != null && !ReferenceEquals(Unit.radar, nativeRadar) && !ReferenceEquals(Unit.radar, nativeDetector))
+            {
+                Unit.radar.activated = Unit.radar is Radar
+                    ? (isTrueRadarSite && activeNow)
+                    : (activeNow || (IsDeployed && Spec.SensorProfile != null && Spec.SensorProfile.EoIrEmergencyRangeKm > 0f));
+            }
         }
 
         private void Update()
@@ -277,8 +377,13 @@ namespace MDSFramework.Sensors
             bool stowRequested = !targetDeployed || suspendedInTransit || isVehicleMoving;
             if (Animator != null)
             {
-                bool allowTurretOverrides = !stowRequested && Animator.IsFullyDeployed;
+                bool allowTurretOverrides = !stowRequested && Animator.IsFullyDeployed && Animator.NormalizedProgress >= 0.9999f;
                 Animator.TickAnimation(dt, allowTurretOverrides);
+            }
+
+            if (IsRadarEmitting != lastSyncedRadarEmitting)
+            {
+                SyncNativeRadarState();
             }
 
             TurretAim?.TickReplicatedClient(dt, IsRadarEmitting, stowRequested);

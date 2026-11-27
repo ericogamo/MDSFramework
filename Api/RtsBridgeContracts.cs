@@ -53,6 +53,9 @@ namespace MDSFramework.Api
         public static bool IsRtsBridgeAttached { get; private set; }
         public static IRtsBridgeHost Current => Host;
         public static Func<Unit, bool>? QueryUnitHoldFire { get; set; }
+        public static Action<FactionAffinity, string>? RefundAbmInterceptor { get; set; }
+        public static Func<PersistentID, int>? QueryActiveAbmInterceptorsForThreat { get; set; }
+        public static Action<Unit, bool>? SyncMdsSiteHoldFireToRts { get; set; }
 
         public static event Action? OnBridgeChanged;
 
@@ -79,6 +82,9 @@ namespace MDSFramework.Api
             Host.ResetToVanilla();
             IsRtsBridgeAttached = false;
             QueryUnitHoldFire = null;
+            RefundAbmInterceptor = null;
+            QueryActiveAbmInterceptorsForThreat = null;
+            SyncMdsSiteHoldFireToRts = null;
             OnBridgeChanged?.Invoke();
         }
 

@@ -369,17 +369,51 @@ namespace MDSFramework.Deployment
         }
 
         internal static bool TryResolveUnitByDisplayName(
+            Unit? unit,
+            out ContractorPackage pkg,
+            out ModularUnitSpec spec,
+            out UnitDefinition def,
+            out bool isCargoContainer)
+        {
+            return TryResolveUnitByDisplayName(
+                unit != null ? unit.unitName : null,
+                out pkg,
+                out spec,
+                out def,
+                out isCargoContainer,
+                preferCargo: unit is Container);
+        }
+
+        internal static bool TryResolveUnitByDisplayName(
             string? displayName,
             out ContractorPackage pkg,
             out ModularUnitSpec spec,
             out UnitDefinition def,
             out bool isCargoContainer)
         {
+            return TryResolveUnitByDisplayName(
+                displayName,
+                out pkg,
+                out spec,
+                out def,
+                out isCargoContainer,
+                preferCargo: false);
+        }
+
+        internal static bool TryResolveUnitByDisplayName(
+            string? displayName,
+            out ContractorPackage pkg,
+            out ModularUnitSpec spec,
+            out UnitDefinition def,
+            out bool isCargoContainer,
+            bool preferCargo)
+        {
             if (!string.IsNullOrWhiteSpace(displayName))
             {
                 string trimmed = displayName!.Trim();
                 bool isCargoPrefix = trimmed.StartsWith("[MDS Cargo] ", StringComparison.OrdinalIgnoreCase);
-                string lookupKey = isCargoPrefix ? trimmed.Substring("[MDS Cargo] ".Length) : trimmed;
+                string lookupKey = isCargoPrefix ? trimmed.Substring("[MDS Cargo] ".Length).Trim() : trimmed;
+                bool wantsCargo = isCargoPrefix || preferCargo;
 
                 MdsUnitCatalogEntry? matched = null;
                 lock (SyncLock)
@@ -387,9 +421,9 @@ namespace MDSFramework.Deployment
                     UnitsByDisplayName.TryGetValue(lookupKey, out matched);
                 }
 
-                if (matched != null)
+                if (wantsCargo)
                 {
-                    if (isCargoPrefix && AirdropCatalogManager.TryGetEntryByUnitId(matched.Spec.UnitId, out AirdropCatalogEntry airdropEntry))
+                    if (matched != null && AirdropCatalogManager.TryGetEntryByUnitId(matched.Spec.UnitId, out AirdropCatalogEntry airdropEntry))
                     {
                         pkg = airdropEntry.Package;
                         spec = airdropEntry.Spec;
@@ -398,10 +432,31 @@ namespace MDSFramework.Deployment
                         return true;
                     }
 
+                    if (AirdropCatalogManager.TryGetEntryByDisplayName(lookupKey, out AirdropCatalogEntry airdropByName))
+                    {
+                        pkg = airdropByName.Package;
+                        spec = airdropByName.Spec;
+                        def = airdropByName.CargoDefinition;
+                        isCargoContainer = true;
+                        return true;
+                    }
+                }
+
+                if (matched != null)
+                {
                     pkg = matched.Package;
                     spec = matched.Spec;
                     def = matched.Definition;
                     isCargoContainer = matched.IsCargoContainer;
+                    return true;
+                }
+
+                if (AirdropCatalogManager.TryGetEntryByDisplayName(lookupKey, out AirdropCatalogEntry fallbackCargo))
+                {
+                    pkg = fallbackCargo.Package;
+                    spec = fallbackCargo.Spec;
+                    def = fallbackCargo.CargoDefinition;
+                    isCargoContainer = true;
                     return true;
                 }
             }
@@ -413,11 +468,6 @@ namespace MDSFramework.Deployment
             return false;
         }
 
-        private static void OnPackageRegistered(ContractorPackage _)
-        {
-            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
-        }
-
         private static bool RegisterUnitEntryLocked(Encyclopedia enc, ContractorPackage pkg, ModularUnitSpec spec)
         {
             UnitDefinition? templateDef = GameInteropHelpers.ResolveEncyclopediaUnitTemplate(spec.BaseDefinitionCloneKey);
@@ -427,15 +477,45 @@ namespace MDSFramework.Deployment
                 return false;
             }
 
+            string rawDisplayName = string.IsNullOrWhiteSpace(spec.DisplayName) ? spec.UnitId : spec.DisplayName.Trim();
+            string resolvedDisplayName = rawDisplayName;
+            if (UnitsByDisplayName.TryGetValue(resolvedDisplayName, out MdsUnitCatalogEntry existingDisplay) &&
+                !string.Equals(existingDisplay.Spec.UnitId, spec.UnitId, StringComparison.OrdinalIgnoreCase))
+            {
+                MdsLog.Warn($"[Catalog] DisplayName '{rawDisplayName}' collides between '{existingDisplay.Spec.UnitId}' and '{spec.UnitId}'; disambiguating.");
+                string candidate = $"{rawDisplayName} [{spec.UnitId}]";
+                int suffix = 2;
+                while (UnitsByDisplayName.TryGetValue(candidate, out MdsUnitCatalogEntry existingCand) &&
+                       !string.Equals(existingCand.Spec.UnitId, spec.UnitId, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidate = $"{rawDisplayName} [{spec.UnitId} #{suffix++}]";
+                }
+
+                resolvedDisplayName = candidate;
+                spec.DisplayName = resolvedDisplayName;
+            }
+
+            float unitCost = spec.Logistics?.CreditCost ?? 100f;
+            if ((spec.IsMobileVehicle || templateDef is VehicleDefinition) && unitCost <= 0.5f)
+            {
+                float fallbackCost = spec.IsContainerHauler ? 45f : 25f;
+                MdsLog.Warn($"[Catalog] Mobile vehicle '{spec.UnitId}' has CreditCost={unitCost:0.###}; clamping to minimum floor {fallbackCost:0.#}.");
+                unitCost = fallbackCost;
+                if (spec.Logistics != null)
+                {
+                    spec.Logistics.CreditCost = fallbackCost;
+                }
+            }
+
             string jsonKey = $"mds_{spec.UnitId}";
             UnitDefinition clonedDef = UnityEngine.Object.Instantiate(templateDef);
             clonedDef.hideFlags = HideFlags.DontUnloadUnusedAsset;
             clonedDef.name = jsonKey;
             clonedDef.jsonKey = jsonKey;
-            clonedDef.unitName = $"[MDS] {spec.DisplayName}";
+            clonedDef.unitName = $"[MDS] {resolvedDisplayName}";
             clonedDef.code = BuildShortCode(spec);
             clonedDef.description = BuildUnitDescription(pkg, spec);
-            clonedDef.value = Mathf.Max(0.05f, spec.Logistics?.CreditCost ?? 100f);
+            clonedDef.value = Mathf.Max(0.05f, unitCost);
             clonedDef.radarSize = Mathf.Max(0.05f, spec.StowedRcs);
             if (!(clonedDef is VehicleDefinition))
             {
@@ -483,14 +563,18 @@ namespace MDSFramework.Deployment
             UnitsByUnitId[spec.UnitId] = entry;
             UnitsByDefinition[clonedDef] = entry;
             UnitsByKey[jsonKey] = entry;
-            if (UnitsByDisplayName.TryGetValue(spec.DisplayName, out MdsUnitCatalogEntry existingDisplay) &&
-                !string.Equals(existingDisplay.Spec.UnitId, spec.UnitId, StringComparison.OrdinalIgnoreCase))
+            if (!UnitsByDisplayName.TryGetValue(resolvedDisplayName, out MdsUnitCatalogEntry curPrimary) ||
+                string.Equals(curPrimary.Spec.UnitId, spec.UnitId, StringComparison.OrdinalIgnoreCase))
             {
-                MdsLog.Warn($"[Catalog] DisplayName '{spec.DisplayName}' collides between '{existingDisplay.Spec.UnitId}' and '{spec.UnitId}'.");
+                UnitsByDisplayName[resolvedDisplayName] = entry;
             }
 
-            UnitsByDisplayName[spec.DisplayName] = entry;
-            UnitsByDisplayName[clonedDef.unitName] = entry;
+            if (!UnitsByDisplayName.TryGetValue(clonedDef.unitName, out MdsUnitCatalogEntry curPrefixed) ||
+                string.Equals(curPrefixed.Spec.UnitId, spec.UnitId, StringComparison.OrdinalIgnoreCase))
+            {
+                UnitsByDisplayName[clonedDef.unitName] = entry;
+            }
+
             RegisteredUnitCount = UnitsByUnitId.Count;
             return true;
         }
@@ -507,12 +591,30 @@ namespace MDSFramework.Deployment
                 return false;
             }
 
+            string rawDisplayName = string.IsNullOrWhiteSpace(spec.DisplayName) ? spec.MissileId : spec.DisplayName.Trim();
+            string resolvedDisplayName = rawDisplayName;
+            if (MissilesByDisplayName.TryGetValue(resolvedDisplayName, out MdsMissileCatalogEntry existingDisplayM) &&
+                !string.Equals(existingDisplayM.Spec.MissileId, spec.MissileId, StringComparison.OrdinalIgnoreCase))
+            {
+                MdsLog.Warn($"[Catalog] Missile DisplayName '{rawDisplayName}' collides between '{existingDisplayM.Spec.MissileId}' and '{spec.MissileId}'; disambiguating.");
+                string candidate = $"{rawDisplayName} [{spec.MissileId}]";
+                int suffix = 2;
+                while (MissilesByDisplayName.TryGetValue(candidate, out MdsMissileCatalogEntry existingCandM) &&
+                       !string.Equals(existingCandM.Spec.MissileId, spec.MissileId, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidate = $"{rawDisplayName} [{spec.MissileId} #{suffix++}]";
+                }
+
+                resolvedDisplayName = candidate;
+                spec.DisplayName = resolvedDisplayName;
+            }
+
             string jsonKey = $"mds_missile_{spec.MissileId}";
             MissileDefinition clonedMissile = UnityEngine.Object.Instantiate(templateMissile);
             clonedMissile.hideFlags = HideFlags.DontUnloadUnusedAsset;
             clonedMissile.name = jsonKey;
             clonedMissile.jsonKey = jsonKey;
-            clonedMissile.unitName = spec.DisplayName;
+            clonedMissile.unitName = resolvedDisplayName;
             clonedMissile.description = BuildMissileDescription(pkg, spec);
             clonedMissile.dontAutomaticallyAddToEncyclopedia = !MdsConfig.EnableMissionEditorCatalog.Value;
 
@@ -532,14 +634,19 @@ namespace MDSFramework.Deployment
             MissilesById[spec.MissileId] = entry;
             MissilesByDefinition[clonedMissile] = entry;
             MissilesByKey[jsonKey] = entry;
-            if (MissilesByDisplayName.TryGetValue(spec.DisplayName, out MdsMissileCatalogEntry existingDisplayM) &&
-                !string.Equals(existingDisplayM.Spec.MissileId, spec.MissileId, StringComparison.OrdinalIgnoreCase))
+            if (!MissilesByDisplayName.TryGetValue(resolvedDisplayName, out MdsMissileCatalogEntry curPrimaryM) ||
+                string.Equals(curPrimaryM.Spec.MissileId, spec.MissileId, StringComparison.OrdinalIgnoreCase))
             {
-                MdsLog.Warn($"[Catalog] Missile DisplayName '{spec.DisplayName}' collides between '{existingDisplayM.Spec.MissileId}' and '{spec.MissileId}'.");
+                MissilesByDisplayName[resolvedDisplayName] = entry;
             }
 
-            MissilesByDisplayName[spec.DisplayName] = entry;
-            MissilesByDisplayName[$"[MDS] {spec.DisplayName}"] = entry;
+            string prefixedMissileName = $"[MDS] {resolvedDisplayName}";
+            if (!MissilesByDisplayName.TryGetValue(prefixedMissileName, out MdsMissileCatalogEntry curPrefixedM) ||
+                string.Equals(curPrefixedM.Spec.MissileId, spec.MissileId, StringComparison.OrdinalIgnoreCase))
+            {
+                MissilesByDisplayName[prefixedMissileName] = entry;
+            }
+
             RegisteredMissileCount = MissilesById.Count;
             return true;
         }

@@ -11,11 +11,13 @@ namespace MDSFramework.Deployment
     internal sealed class AirdropContainerBehavior : MonoBehaviour
     {
         private const float SettleRequiredSeconds = 1.2f;
+        private const float WaterSplashDespawnSeconds = 6.0f;
 
         internal ContractorPackage Package { get; private set; } = null!;
         internal ModularUnitSpec Spec { get; private set; } = null!;
         internal Container Container { get; private set; } = null!;
         internal FactionAffinity Faction { get; private set; }
+        internal FactionHQ? Hq { get; private set; }
         internal GlbInstantiatedRig? Rig { get; private set; }
         internal GlbKeyframedAnimator? Animator { get; private set; }
         internal GlbTurretAimController? TurretAim { get; private set; }
@@ -23,6 +25,7 @@ namespace MDSFramework.Deployment
         internal bool ConsumedRtsCap = true;
 
         private float settledTimer;
+        private float waterStrandedTimer;
         private bool wasSlungLastFrame;
         private bool initialized;
         private bool capReleased;
@@ -43,11 +46,17 @@ namespace MDSFramework.Deployment
             Package = package;
             Spec = spec;
             Container = container;
+            Hq = container.NetworkHQ ?? container.MapHQ ?? GameInteropHelpers.TryResolveFactionHQ(faction);
             Faction = faction != FactionAffinity.Any
                 ? faction
-                : GameInteropHelpers.ToFactionAffinity(container.NetworkHQ ?? container.MapHQ);
+                : GameInteropHelpers.ToFactionAffinity(Hq);
 
-            container.unitName = spec.DisplayName;
+            string wireCargoName = $"[MDS Cargo] {spec.DisplayName}";
+            if (!string.Equals(container.unitName, wireCargoName, StringComparison.Ordinal))
+            {
+                container.NetworkunitName = wireCargoName;
+            }
+
             container.RCS = Mathf.Max(0.02f, spec.StowedRcs);
             container.onDisableUnit += OnContainerDisabled;
 
@@ -76,11 +85,26 @@ namespace MDSFramework.Deployment
                 Animator?.TickAnimation(dt, allowTurretOverrides: false);
                 if (!isSlung && IsDryGroundSettled(dt))
                 {
+                    waterStrandedTimer = 0f;
                     ActivateAsModularSite();
                 }
                 else if (isSlung)
                 {
                     settledTimer = 0f;
+                    waterStrandedTimer = 0f;
+                }
+                else if (GameInteropHelpers.IsServerAuthority() && IsStrandedInWater())
+                {
+                    waterStrandedTimer += dt;
+                    if (waterStrandedTimer >= WaterSplashDespawnSeconds)
+                    {
+                        DespawnWaterStrandedContainer();
+                        return;
+                    }
+                }
+                else
+                {
+                    waterStrandedTimer = 0f;
                 }
 
                 wasSlungLastFrame = isSlung;
@@ -97,6 +121,10 @@ namespace MDSFramework.Deployment
             }
             else if (ActivatedSite.SuspendedInTransit && !isSlung && IsDryGroundSettled(dt))
             {
+                Vector3 euler = Container.transform.eulerAngles;
+                Container.transform.rotation = Quaternion.Euler(0f, euler.y, 0f);
+                Physics.SyncTransforms();
+
                 ActivatedSite.SuspendedInTransit = false;
                 ActivatedSite.LastThreatSeenTime = Time.time;
                 RtsBridgeHost.Current.AiThreats.ReportDeployedModularSite(
@@ -105,10 +133,50 @@ namespace MDSFramework.Deployment
                     Spec.Role,
                     Container.transform.position,
                     ActivatedSite.IsRadarEmitting);
+                MdsNetworkSync.BroadcastContainerLanded(Container.persistentID.Id, euler.y, Spec.ContainerLengthMeters);
                 MdsLog.Info($"[Airdrop] '{ActivatedSite.SiteId}' resettled after sling-load relocation.");
             }
 
             wasSlungLastFrame = isSlung;
+        }
+
+        private bool IsStrandedInWater()
+        {
+            Vector3 pos = Container.transform.position;
+            if (pos.y > Datum.LocalSeaY + 0.55f)
+            {
+                return false;
+            }
+
+            if (Physics.Raycast(
+                    pos + Vector3.up * 1.5f,
+                    Vector3.down,
+                    out RaycastHit hit,
+                    3.0f,
+                    (int)PhysicsLayers.StaticsMask,
+                    QueryTriggerInteraction.Ignore) &&
+                hit.point.y > Datum.LocalSeaY + 0.20f)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private void DespawnWaterStrandedContainer()
+        {
+            ReleaseUnactivatedCapOnce();
+            if (Rig != null && Rig.RootObject != null)
+            {
+                Rig.RootObject.SetActive(false);
+            }
+
+            MdsLog.Info($"[Airdrop] Container '{Spec?.UnitId}' stranded in water for {WaterSplashDespawnSeconds:0.#}s; despawning and releasing RTS cap.");
+            Container.DisableUnit();
+            if (GameManager.gameState == GameState.SinglePlayer && Container != null)
+            {
+                UnityEngine.Object.Destroy(Container.gameObject, 2f);
+            }
         }
 
         private bool IsDryGroundSettled(float dt)
@@ -120,11 +188,31 @@ namespace MDSFramework.Deployment
                 return false;
             }
 
+            if (Container.transform.parent != null && Container.transform.parent.GetComponentInParent<Ship>() != null)
+            {
+                settledTimer = 0f;
+                return false;
+            }
+
+            if (Physics.Raycast(
+                    pos + Vector3.up * 1.5f,
+                    Vector3.down,
+                    out RaycastHit shipHit,
+                    4.5f,
+                    (int)PhysicsLayers.ShipsMask,
+                    QueryTriggerInteraction.Ignore) &&
+                shipHit.collider != null &&
+                shipHit.collider.GetComponentInParent<Ship>() != null)
+            {
+                settledTimer = 0f;
+                return false;
+            }
+
             bool grounded = Container.Networkkinematic;
             if (!grounded)
             {
                 float speedSq = Container.rb != null ? Container.rb.velocity.sqrMagnitude : 99f;
-                int groundMask = (int)PhysicsLayers.StaticsMask | (int)PhysicsLayers.ShipsMask;
+                int groundMask = (int)PhysicsLayers.StaticsMask;
                 if (speedSq < 0.36f &&
                     Physics.Raycast(pos + Vector3.up * 1.5f, Vector3.down, 4.5f, groundMask, QueryTriggerInteraction.Ignore))
                 {
@@ -353,6 +441,11 @@ namespace MDSFramework.Deployment
 
         private void OnContainerDisabled(Unit _)
         {
+            if (ActivatedSite == null && Rig != null && Rig.RootObject != null)
+            {
+                Rig.RootObject.SetActive(false);
+            }
+
             ReleaseUnactivatedCapOnce();
         }
 
@@ -368,12 +461,22 @@ namespace MDSFramework.Deployment
 
         private void ReleaseUnactivatedCapOnce()
         {
-            if (capReleased || ActivatedSite != null || !ConsumedRtsCap || MdsRuntimeController.IsResettingScene)
+            if (capReleased ||
+                ActivatedSite != null ||
+                !ConsumedRtsCap ||
+                MdsRuntimeController.IsResettingScene ||
+                !GameInteropHelpers.IsServerAuthority())
             {
                 return;
             }
 
             capReleased = true;
+            Hq ??= Container != null ? (Container.NetworkHQ ?? Container.MapHQ) : null;
+            if (Faction == FactionAffinity.Any && Hq != null)
+            {
+                Faction = GameInteropHelpers.ToFactionAffinity(Hq);
+            }
+
             if (Spec?.Logistics != null)
             {
                 RtsBridgeHost.Current.Caps.ReleaseCap(Faction, Spec.Logistics.CapCategory, Spec.Logistics.CapWeight);

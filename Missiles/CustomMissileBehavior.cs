@@ -46,6 +46,7 @@ namespace MDSFramework.Missiles
         internal static void ResetSession()
         {
             ActiveByUnitId.Clear();
+            CustomMissileBehavior.ClearTerrainCache();
         }
     }
 
@@ -60,6 +61,23 @@ namespace MDSFramework.Missiles
 
         private static readonly int TerrainClearanceMask = (int)PhysicsLayers.StaticsMask | (int)PhysicsLayers.ExclusionZonesMask;
         private const float LandTreeClearanceMeters = 58f;
+        private const float TerrainCacheCellMeters = 300f;
+        private static readonly Dictionary<long, float> TerrainHeightCache = new Dictionary<long, float>(2048);
+        private static float cachedTerrainSeaY = float.NaN;
+
+        private static readonly FieldInfo? SarhKnownPosField = typeof(SARHSeeker).GetField("knownPos", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly FieldInfo? SarhKnownVelField = typeof(SARHSeeker).GetField("knownVel", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly FieldInfo? SarhGuidanceDelayField = typeof(SARHSeeker).GetField("guidanceDelay", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly FieldInfo? SarhArmDelayField = typeof(SARHSeeker).GetField("armDelay", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly FieldInfo? SarhSelfDestructSpeedField = typeof(SARHSeeker).GetField("selfDestructAtSpeed", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly FieldInfo? SarhJamToleranceField = typeof(SARHSeeker).GetField("jamTolerance", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        private static readonly FieldInfo? SarhTargetTransformField = typeof(SARHSeeker).GetField("targetTransform", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+        internal static void ClearTerrainCache()
+        {
+            TerrainHeightCache.Clear();
+            cachedTerrainSeaY = float.NaN;
+        }
 
         private GlbInstantiatedRig? rig;
         private GlbKeyframedAnimator? animator;
@@ -86,6 +104,8 @@ namespace MDSFramework.Missiles
         private Vector3 lastKnownHojVel;
         private float lastKnownHojTime;
         private bool hasLastKnownHoj;
+        private Vector3 lastValidTargetPos;
+        private bool hasLastValidTargetPos;
         private float ecmLostTime = -1f;
         private Vector3 blindFlightDir = Vector3.forward;
         private bool blindFlightDirInitialized;
@@ -186,6 +206,12 @@ namespace MDSFramework.Missiles
                     ? Mathf.Clamp(Mathf.Max(120f, spec.MaxEngagementRangeKm * 15.0f), 120f, 360f)
                     : Mathf.Clamp(spec.MaxEngagementRangeKm * 1.5f, 18f, 120f);
             weaveSeed = (missile.persistentID.Id % 17) * 0.43f;
+            if (targetUnit != null && !targetUnit.disabled)
+            {
+                lastValidTargetPos = targetUnit.transform.position;
+                hasLastValidTargetPos = true;
+            }
+
             if (PassiveHojActive && targetUnit != null && !targetUnit.disabled)
             {
                 lastKnownHojPos = targetUnit.transform.position;
@@ -206,17 +232,9 @@ namespace MDSFramework.Missiles
                 }
             }
 
-            ConfigureSeeker();
-            ExtendMotorForSpecRange();
-            AttachCustomVisualRig();
-            AttachCustomMotorAudio();
-
-            if (isAirDropped &&
-                spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive)
+            bool airDropSeaSkim = isAirDropped && spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive;
+            if (airDropSeaSkim)
             {
-                float seaY = Datum.LocalSeaY;
-                float groundY = Mathf.Max(seaY, SampleTerrainY(missile.transform.position.x, missile.transform.position.z, seaY));
-                float startClearance = missile.transform.position.y - groundY;
                 airDropGlideActive = true;
                 airDropMotorIgnited = false;
                 airDropGlideStartSpeed = Mathf.Max(
@@ -225,6 +243,18 @@ namespace MDSFramework.Missiles
                         ? missile.rb.velocity.magnitude
                         : (missile.startingVelocity.magnitude > 1f ? missile.startingVelocity.magnitude : 210f));
                 HoldFirstMotorDelay(0.45f, muteStartupAudio: true);
+            }
+
+            ConfigureSeeker();
+            ExtendMotorForSpecRange();
+            AttachCustomVisualRig();
+            AttachCustomMotorAudio();
+
+            if (airDropSeaSkim)
+            {
+                float seaY = Datum.LocalSeaY;
+                float groundY = Mathf.Max(seaY, SampleTerrainY(missile.transform.position.x, missile.transform.position.z, seaY));
+                float startClearance = missile.transform.position.y - groundY;
 
                 if (!missile.remoteSim && targetUnit != null && !targetUnit.disabled)
                 {
@@ -300,6 +330,16 @@ namespace MDSFramework.Missiles
                 }
             }
 
+            if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
+                missile.ownerID.IsValid &&
+                missile.ownerID.TryGetUnit(out Unit ownerUnit) &&
+                ownerUnit is Aircraft)
+            {
+                airDropGlideActive = true;
+                airDropMotorIgnited = false;
+                HoldFirstMotorDelay(0.45f, muteStartupAudio: true);
+            }
+
             ExtendMotorForSpecRange();
             AttachCustomVisualRig();
             AttachCustomMotorAudio();
@@ -311,16 +351,6 @@ namespace MDSFramework.Missiles
             else if (spec.IsDecoy || spec.FlightProfile == MissileFlightProfile.Decoy)
             {
                 missile.RCS = 6.5f;
-            }
-
-            if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
-                missile.ownerID.IsValid &&
-                missile.ownerID.TryGetUnit(out Unit ownerUnit) &&
-                ownerUnit is Aircraft)
-            {
-                airDropGlideActive = true;
-                airDropMotorIgnited = false;
-                HoldFirstMotorDelay(0.45f, muteStartupAudio: true);
             }
 
             prevVisualPos = missile.transform.position;
@@ -340,6 +370,10 @@ namespace MDSFramework.Missiles
             airDropMotorIgnited = true;
             airDropGlideActive = false;
             ReleaseFirstMotorDelay();
+            if (customMotorAudioSource != null && !customMotorAudioSource.isPlaying && customMotorAudioSource.clip != null)
+            {
+                customMotorAudioSource.Play();
+            }
         }
 
         internal void TriggerFinDeployment()
@@ -414,6 +448,27 @@ namespace MDSFramework.Missiles
                 if (TargetUnit != null && !TargetUnit.disabled)
                 {
                     GameInteropHelpers.SeekerTargetUnitField?.SetValue(optical, TargetUnit);
+                }
+            }
+            else if (seeker is SARHSeeker sarh)
+            {
+                float tol = Spec.SupportsActiveToPassiveHoj ? 0.50f : 0.35f;
+                SarhJamToleranceField?.SetValue(sarh, tol);
+                SarhSelfDestructSpeedField?.SetValue(sarh, 75f);
+                SarhGuidanceDelayField?.SetValue(sarh, launchedVertically ? 0.80f : 0.45f);
+                SarhArmDelayField?.SetValue(sarh, 1.1f);
+
+                if (TargetUnit != null && !TargetUnit.disabled)
+                {
+                    Vector3 targetVel = TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
+                    GameInteropHelpers.SeekerTargetUnitField?.SetValue(sarh, TargetUnit);
+                    SarhKnownPosField?.SetValue(sarh, GameInteropHelpers.WorldToGlobal(TargetUnit.transform.position));
+                    SarhKnownVelField?.SetValue(sarh, targetVel);
+                    Transform? targetPart = TargetUnit.GetRandomPart();
+                    if (targetPart != null)
+                    {
+                        SarhTargetTransformField?.SetValue(sarh, targetPart);
+                    }
                 }
             }
 
@@ -602,7 +657,10 @@ namespace MDSFramework.Missiles
             }
 
             customMotorAudioSource = src;
-            src.Play();
+            if (!airDropGlideActive || airDropMotorIgnited)
+            {
+                src.Play();
+            }
         }
 
         private void MuteVanillaMissileAudio()
@@ -641,6 +699,16 @@ namespace MDSFramework.Missiles
             {
                 lastVanillaAudioMuteCheck = ageSeconds;
                 MuteVanillaMissileAudio();
+            }
+
+            if (airDropGlideActive && !airDropMotorIgnited)
+            {
+                if (customMotorAudioSource.isPlaying)
+                {
+                    customMotorAudioSource.Stop();
+                }
+
+                return;
             }
 
             if (!customMotorAudioSource.isPlaying && customMotorAudioSource.clip != null)
@@ -959,12 +1027,27 @@ namespace MDSFramework.Missiles
 
             if (TargetUnit != null && !TargetUnit.disabled)
             {
-                Vector3 targetPos = TargetUnit.transform.position;
-                Vector3 targetVel = TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
+                lastValidTargetPos = TargetUnit.transform.position;
+                hasLastValidTargetPos = true;
+
+                bool useHojCoast = Spec.SupportsActiveToPassiveHoj && PassiveHojActive && hasLastKnownHoj &&
+                                   (Missile.NetworkHQ == null || !Missile.NetworkHQ.IsTargetBeingTracked(TargetUnit));
+                Vector3 targetPos = useHojCoast ? lastKnownHojPos : TargetUnit.transform.position;
+                Vector3 targetVel = useHojCoast ? lastKnownHojVel : (TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero);
                 float dist = Vector3.Distance(myPos, targetPos);
                 float tti = Mathf.Clamp(dist / Mathf.Max(180f, currentSpeed), 0.05f, 8.0f);
                 Vector3 routeAim = targetPos + (targetVel * (tti * 0.75f));
                 UpdateSeaSkimmingEvasiveProfile(myPos, targetPos, targetVel, dist, tti, dt, ref routeAim);
+                horizAim = routeAim;
+                targetTerrainAheadY = Mathf.Max(localFloorY, routeAim.y);
+            }
+            else if (Spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive)
+            {
+                Vector3 fallbackTarget = GetFallbackSeaSkimTargetPos(myPos);
+                float dist = Vector3.Distance(myPos, fallbackTarget);
+                float tti = Mathf.Clamp(dist / Mathf.Max(180f, currentSpeed), 0.05f, 8.0f);
+                Vector3 routeAim = fallbackTarget;
+                UpdateSeaSkimmingEvasiveProfile(myPos, fallbackTarget, Vector3.zero, dist, tti, dt, ref routeAim);
                 horizAim = routeAim;
                 targetTerrainAheadY = Mathf.Max(localFloorY, routeAim.y);
             }
@@ -1114,6 +1197,16 @@ namespace MDSFramework.Missiles
             }
 
             float minAliveSpeed = Spec.IsAntiVehicle ? 45f : 85f;
+            if (Missile.speed < minAliveSpeed)
+            {
+                return false;
+            }
+
+            if (ageSeconds >= 10.0f && !Missile.EngineOn() && (Missile.LosingGround() || Missile.MissedTarget()))
+            {
+                return false;
+            }
+
             if (TargetUnit != null && !TargetUnit.disabled)
             {
                 if (Vector3.Distance(Missile.transform.position, TargetUnit.transform.position) <= 220f)
@@ -1121,7 +1214,12 @@ namespace MDSFramework.Missiles
                     return false;
                 }
 
-                if (ageSeconds < 10.0f || Missile.EngineOn() || Missile.speed >= minAliveSpeed)
+                if (ageSeconds < 10.0f || Missile.EngineOn())
+                {
+                    return true;
+                }
+
+                if (PassiveHojActive && !Missile.MissedTarget())
                 {
                     return true;
                 }
@@ -1133,7 +1231,7 @@ namespace MDSFramework.Missiles
                     return false;
                 }
 
-                if (ageSeconds < 10.0f || Missile.EngineOn() || Missile.speed >= minAliveSpeed)
+                if ((ageSeconds < 10.0f || Missile.EngineOn()) && !Missile.MissedTarget())
                 {
                     return true;
                 }
@@ -1253,24 +1351,40 @@ namespace MDSFramework.Missiles
 
                     if (ReferenceEquals(TargetUnit, tr.JammerUnit))
                     {
-                        jammerDetected = true;
-                        bool onboardPassive = (tr.JammerUnit.transform.position - myPos).sqrMagnitude <= onboardPassiveRfRangeSq;
-                        jammerPos = onboardPassive ? tr.JammerUnit.transform.position : tr.TriangulatedWorldPos;
-                        jammerVel = onboardPassive
-                            ? (tr.JammerUnit.rb != null ? tr.JammerUnit.rb.velocity : Vector3.zero)
-                            : tr.Velocity;
-                        break;
+                        Vector3 candPos = tr.JammerUnit.transform.position;
+                        float distSq = (candPos - myPos).sqrMagnitude;
+                        bool directLos = !Physics.Linecast(myPos, candPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore);
+                        if (directLos || distSq > onboardPassiveRfRangeSq)
+                        {
+                            jammerDetected = true;
+                            bool onboardPassive = directLos && distSq <= onboardPassiveRfRangeSq;
+                            jammerPos = onboardPassive ? candPos : tr.TriangulatedWorldPos;
+                            jammerVel = onboardPassive
+                                ? (tr.JammerUnit.rb != null ? tr.JammerUnit.rb.velocity : Vector3.zero)
+                                : tr.Velocity;
+                            break;
+                        }
+
+                        continue;
                     }
 
                     if (TargetUnit == null)
                     {
+                        Vector3 candPos = tr.JammerUnit.transform.position;
                         Vector3 toJammer = tr.TriangulatedWorldPos - myPos;
+                        float distSq = (candPos - myPos).sqrMagnitude;
                         if (toJammer.sqrMagnitude <= maxRangeSq &&
                             Vector3.Angle(myFwd, toJammer) <= 60f)
                         {
+                            bool directLos = !Physics.Linecast(myPos, candPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore);
+                            if (!directLos && distSq <= onboardPassiveRfRangeSq)
+                            {
+                                continue;
+                            }
+
                             jammerDetected = true;
-                            bool onboardPassive = (tr.JammerUnit.transform.position - myPos).sqrMagnitude <= onboardPassiveRfRangeSq;
-                            jammerPos = onboardPassive ? tr.JammerUnit.transform.position : tr.TriangulatedWorldPos;
+                            bool onboardPassive = directLos && distSq <= onboardPassiveRfRangeSq;
+                            jammerPos = onboardPassive ? candPos : tr.TriangulatedWorldPos;
                             jammerVel = onboardPassive
                                 ? (tr.JammerUnit.rb != null ? tr.JammerUnit.rb.velocity : Vector3.zero)
                                 : tr.Velocity;
@@ -1303,7 +1417,8 @@ namespace MDSFramework.Missiles
                 try
                 {
                     object? jammed = GameInteropHelpers.ArhIsJammedField.GetValue(arh);
-                    if (jammed is bool b && b && TargetUnit != null && !TargetUnit.disabled)
+                    if (jammed is bool b && b && TargetUnit != null && !TargetUnit.disabled &&
+                        !Physics.Linecast(Missile.transform.position, TargetUnit.transform.position, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                     {
                         jammerDetected = true;
                         jammerPos = TargetUnit.transform.position;
@@ -1366,25 +1481,43 @@ namespace MDSFramework.Missiles
             else if (PassiveHojActive)
             {
                 bool hasLiveTarget = TargetUnit != null && !TargetUnit.disabled;
-                float distToTarget = hasLiveTarget
-                    ? Vector3.Distance(Missile.transform.position, TargetUnit!.transform.position)
-                    : float.MaxValue;
+                ARHSeeker? arhTerm = GameInteropHelpers.SafeGetSeeker(Missile) as ARHSeeker;
+                bool arhRadarLocked = arhTerm != null &&
+                                      GameInteropHelpers.ArhRadarLockField?.GetValue(arhTerm) is bool rle &&
+                                      rle;
                 bool hqTracked = hasLiveTarget &&
                                  Missile.NetworkHQ != null &&
                                  Missile.NetworkHQ.IsTargetBeingTracked(TargetUnit!);
 
-                if (hasLiveTarget && (distToTarget <= 16000f || hqTracked))
+                if (hasLiveTarget && (arhRadarLocked || hqTracked))
                 {
-                    // Enter active terminal lock once within autonomous ARH range or back on HQ radar.
+                    // Only re-enter active/datalink tracking once ARHSeeker establishes radar lock or HQ tracks the target.
                     PassiveHojActive = false;
-                    Missile.NetworkseekerMode = Missile.SeekerMode.activeLock;
-                    if (GameInteropHelpers.SafeGetSeeker(Missile) is ARHSeeker arhTerm)
+                    if (arhRadarLocked)
                     {
-                        Vector3 tPos = TargetUnit!.transform.position;
-                        Vector3 tVel = TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
+                        Missile.NetworkseekerMode = Missile.SeekerMode.activeLock;
+                    }
+                    else if (Missile.seekerMode == Missile.SeekerMode.passive)
+                    {
+                        Missile.NetworkseekerMode = Missile.SeekerMode.activeSearch;
+                    }
+
+                    if (arhTerm != null)
+                    {
                         GameInteropHelpers.SeekerTargetUnitField?.SetValue(arhTerm, TargetUnit);
-                        GameInteropHelpers.ArhKnownPosField?.SetValue(arhTerm, GameInteropHelpers.WorldToGlobal(tPos));
-                        GameInteropHelpers.ArhKnownVelField?.SetValue(arhTerm, tVel);
+                        if (arhRadarLocked)
+                        {
+                            Vector3 tPos = TargetUnit!.transform.position;
+                            Vector3 tVel = TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
+                            GameInteropHelpers.ArhKnownPosField?.SetValue(arhTerm, GameInteropHelpers.WorldToGlobal(tPos));
+                            GameInteropHelpers.ArhKnownVelField?.SetValue(arhTerm, tVel);
+                        }
+                        else if (Missile.NetworkHQ != null && Missile.NetworkHQ.TryGetKnownPosition(TargetUnit!, out GlobalPosition hqPos))
+                        {
+                            Vector3 tVel = TargetUnit!.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
+                            GameInteropHelpers.ArhKnownPosField?.SetValue(arhTerm, hqPos);
+                            GameInteropHelpers.ArhKnownVelField?.SetValue(arhTerm, tVel);
+                        }
                     }
                 }
                 else if (hasLastKnownHoj && (Time.time - lastKnownHojTime) <= 22f)
@@ -1442,7 +1575,7 @@ namespace MDSFramework.Missiles
             }
 
             return SensorNetworkManager.Instance != null &&
-                   SensorNetworkManager.Instance.HasFreshDirectJamEvent(u, 0.65f);
+                   SensorNetworkManager.Instance.HasFreshDirectJamEvent(u, 3.5f);
         }
 
         private bool TryGetFriendlyHojTrack(Unit target, out HojTrackEntry matched)
@@ -1652,6 +1785,32 @@ namespace MDSFramework.Missiles
             }
         }
 
+        private Vector3 GetFallbackSeaSkimTargetPos(Vector3 myPos)
+        {
+            Vector3 fwd = Missile != null && Missile.rb != null && Missile.rb.velocity.sqrMagnitude > 25f
+                ? new Vector3(Missile.rb.velocity.x, 0f, Missile.rb.velocity.z).normalized
+                : new Vector3(initialLaunchDir.x, 0f, initialLaunchDir.z).normalized;
+            if (fwd.sqrMagnitude < 0.01f)
+            {
+                fwd = Vector3.forward;
+            }
+
+            Vector3 dest = hasLastValidTargetPos
+                ? lastValidTargetPos
+                : (routePrecomputed && precomputedRoutePoints.Count > 0
+                    ? precomputedRoutePoints[precomputedRoutePoints.Count - 1]
+                    : myPos + (fwd * 5000f));
+
+            Vector3 flatDelta = new Vector3(dest.x - myPos.x, 0f, dest.z - myPos.z);
+            if (flatDelta.sqrMagnitude < 450f * 450f)
+            {
+                dest = myPos + (fwd * 5000f);
+                dest.y = Datum.LocalSeaY + Mathf.Max(2.6f, Spec.SeaSkimAltitudeMeters);
+            }
+
+            return dest;
+        }
+
         private void UpdateFlightProfileGuidance(float dt)
         {
             if (Spec.RequiresTargetEcmToTrack && !IsTargetActivelyJamming)
@@ -1659,14 +1818,36 @@ namespace MDSFramework.Missiles
                 return;
             }
 
-            if (TargetUnit == null || TargetUnit.disabled || Missile.rb == null)
+            if (Missile.rb == null)
             {
                 return;
             }
 
             Vector3 myPos = Missile.transform.position;
-            Vector3 targetPos = TargetUnit.transform.position;
-            Vector3 targetVel = TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
+            Unit? liveTarget = TargetUnit;
+            Vector3 targetPos;
+            Vector3 targetVel;
+
+            if (liveTarget != null && !liveTarget.disabled)
+            {
+                lastValidTargetPos = liveTarget.transform.position;
+                hasLastValidTargetPos = true;
+
+                bool useHojCoast = Spec.SupportsActiveToPassiveHoj && PassiveHojActive && hasLastKnownHoj &&
+                                   (Missile.NetworkHQ == null || !Missile.NetworkHQ.IsTargetBeingTracked(liveTarget));
+                targetPos = useHojCoast ? lastKnownHojPos : liveTarget.transform.position;
+                targetVel = useHojCoast ? lastKnownHojVel : (liveTarget.rb != null ? liveTarget.rb.velocity : Vector3.zero);
+            }
+            else if (Spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive)
+            {
+                targetPos = GetFallbackSeaSkimTargetPos(myPos);
+                targetVel = Vector3.zero;
+            }
+            else
+            {
+                return;
+            }
+
             Vector3 toTarget = targetPos - myPos;
             float dist = toTarget.magnitude;
             if (dist < 1f)
@@ -1768,9 +1949,7 @@ namespace MDSFramework.Missiles
                 Vector3 desiredDir = (aimPoint - myPos).normalized;
                 float speed = Missile.rb.velocity.magnitude;
                 float targetSpeed = Spec.TargetMach > 0f ? Spec.TargetMach * 340.3f : Mathf.Max(280f, Spec.CruiseSpeedMps);
-                float nextSpeed = Spec.TargetMach > 0f && ageSeconds > (Spec.BoosterDropSeconds > 0f ? Spec.BoosterDropSeconds : 1.6f)
-                    ? Mathf.MoveTowards(speed, targetSpeed, dt * 95f)
-                    : speed;
+                bool engineOn = Missile.EngineOn();
                 if (speed > 35f && desiredDir.sqrMagnitude > 0.01f)
                 {
                     Vector3 prevDir = Missile.rb.velocity.normalized;
@@ -1785,12 +1964,27 @@ namespace MDSFramework.Missiles
                         ? highestLocal + 32f
                         : seaY + 2.55f;
 
-                    Vector3 nextPosCheck = myPos + (newDir * (nextSpeed * Mathf.Max(dt, 0.25f)));
+                    Vector3 nextPosCheck = myPos + (newDir * (speed * Mathf.Max(dt, 0.25f)));
                     if (nextPosCheck.y < safeFloorY && dist > 180f)
                     {
-                        float neededDy = Mathf.Clamp((safeFloorY - myPos.y) / Mathf.Max(45f, nextSpeed * 0.65f), 0.04f, 0.55f);
+                        float neededDy = Mathf.Clamp((safeFloorY - myPos.y) / Mathf.Max(45f, speed * 0.65f), 0.04f, 0.55f);
                         newDir.y = Mathf.Max(neededDy, newDir.y);
                         newDir.Normalize();
+                    }
+
+                    float nextSpeed;
+                    if (engineOn)
+                    {
+                        nextSpeed = Spec.TargetMach > 0f && ageSeconds > (Spec.BoosterDropSeconds > 0f ? Spec.BoosterDropSeconds : 1.6f)
+                            ? Mathf.MoveTowards(speed, targetSpeed, dt * 95f)
+                            : speed;
+                    }
+                    else
+                    {
+                        float sinFlight = Mathf.Clamp(newDir.y, -0.9f, 0.9f);
+                        float turnRateRad = Vector3.Angle(prevDir, newDir) * Mathf.Deg2Rad / Mathf.Max(0.005f, dt);
+                        float glideAccel = (-Physics.gravity.magnitude * sinFlight) - (speed * speed * 0.00022f) - (turnRateRad * 14f);
+                        nextSpeed = Mathf.Max(5f, speed + (glideAccel * dt));
                     }
 
                     Vector3 prevFlat = new Vector3(prevDir.x, 0f, prevDir.z);
@@ -1894,17 +2088,23 @@ namespace MDSFramework.Missiles
 
         private void EnsureDynamicRouteUpdated(Vector3 myPos, Vector3 targetPos, float dist, float targetMoveThreshold)
         {
+            uint missileHash = Missile != null && Missile.persistentID.IsValid
+                ? Missile.persistentID.Id
+                : (uint)GetInstanceID();
+            float salvoStagger = (missileHash % 7) * 0.35f;
+            float minCooldown = 4.5f + salvoStagger;
+
             bool needsTargetMovedRecompute =
-                Time.time - lastRouteRecomputeTime >= 3.5f &&
+                Time.time - lastRouteRecomputeTime >= minCooldown &&
                 dist > 1200f &&
                 Vector3.SqrMagnitude(targetPos - routeTargetAnchorPos) > targetMoveThreshold * targetMoveThreshold;
 
             bool needsLiveAaRecompute = false;
             if (Time.time >= nextLiveAaCheckTime)
             {
-                nextLiveAaCheckTime = Time.time + 1.5f;
+                nextLiveAaCheckTime = Time.time + 2.0f + salvoStagger;
                 if (dist > 1400f &&
-                    Time.time - lastRouteRecomputeTime >= 3.5f &&
+                    Time.time - lastRouteRecomputeTime >= minCooldown &&
                     routePrecomputed &&
                     precomputedRoutePoints.Count >= 2)
                 {
@@ -2033,7 +2233,6 @@ namespace MDSFramework.Missiles
             float cruiseTargetSpeed = Mathf.Max(85f, Spec.CruiseSpeedMps > 0f ? Spec.CruiseSpeedMps : 135f);
             float diveTargetSpeed = Spec.MaxSpeedMps > cruiseTargetSpeed ? Spec.MaxSpeedMps : cruiseTargetSpeed * 1.25f;
             float targetSpeed = inTerminalDive ? diveTargetSpeed : cruiseTargetSpeed;
-            float nextSpeed = Mathf.MoveTowards(speed, targetSpeed, dt * (inTerminalDive ? 55f : 40f));
 
             Vector3 prevDir = vel / speed;
             float turnRate = emergencyPullUpThisTick ? 3.4f : (inTerminalDive ? 2.45f : 1.55f);
@@ -2048,13 +2247,26 @@ namespace MDSFramework.Missiles
                 float safeFloorY = highestLocal > seaY + 0.5f
                     ? highestLocal + (inTerminalDive ? 18f : 38f)
                     : seaY + (inTerminalDive ? 8f : 18f);
-                Vector3 nextPosCheck = myPos + (newDir * (nextSpeed * Mathf.Max(dt, 0.25f)));
+                Vector3 nextPosCheck = myPos + (newDir * (speed * Mathf.Max(dt, 0.25f)));
                 if (nextPosCheck.y < safeFloorY)
                 {
-                    float neededDy = Mathf.Clamp((safeFloorY - myPos.y) / Mathf.Max(40f, nextSpeed * 0.55f), 0.04f, 0.60f);
+                    float neededDy = Mathf.Clamp((safeFloorY - myPos.y) / Mathf.Max(40f, speed * 0.55f), 0.04f, 0.60f);
                     newDir.y = Mathf.Max(neededDy, newDir.y);
                     newDir.Normalize();
                 }
+            }
+
+            float nextSpeed;
+            if (Missile.EngineOn())
+            {
+                nextSpeed = Mathf.MoveTowards(speed, targetSpeed, dt * (inTerminalDive ? 55f : 40f));
+            }
+            else
+            {
+                float sinFlight = Mathf.Clamp(newDir.y, -0.95f, 0.95f);
+                float turnRateRad = Vector3.Angle(prevDir, newDir) * Mathf.Deg2Rad / Mathf.Max(0.005f, dt);
+                float glideAccel = (-Physics.gravity.magnitude * sinFlight) - (speed * speed * 0.00032f) - (turnRateRad * 10f);
+                nextSpeed = Mathf.Max(5f, speed + (glideAccel * dt));
             }
 
             Vector3 prevFlat = new Vector3(prevDir.x, 0f, prevDir.z);
@@ -2271,9 +2483,8 @@ namespace MDSFramework.Missiles
                 return;
             }
 
-            float stepMeters = Mathf.Clamp(totalLen / 380f, 100f, 160f);
-            var samplePts = new List<Vector3>(256);
-            var segDirs = new List<Vector3>(256);
+            float stepMeters = Mathf.Clamp(totalLen / 110f, 240f, 500f);
+            var samplePts = new List<Vector3>(128);
 
             for (int w = 0; w < waypoints.Length - 1; w++)
             {
@@ -2285,14 +2496,12 @@ namespace MDSFramework.Missiles
                     continue;
                 }
 
-                Vector3 dir = new Vector3(b.x - a.x, 0f, b.z - a.z).normalized;
                 int steps = Mathf.Max(1, Mathf.CeilToInt(segLen / stepMeters));
                 int startStep = w == 0 ? 0 : 1;
                 for (int s = startStep; s <= steps; s++)
                 {
                     float t = s / (float)steps;
                     samplePts.Add(new Vector3(Mathf.Lerp(a.x, b.x, t), seaY, Mathf.Lerp(a.z, b.z, t)));
-                    segDirs.Add(dir);
                 }
             }
 
@@ -2308,11 +2517,7 @@ namespace MDSFramework.Missiles
             for (int i = 0; i < n; i++)
             {
                 Vector3 pt = samplePts[i];
-                Vector3 side = Vector3.Cross(Vector3.up, segDirs[i]).normalized;
-                float hCenter = SampleTerrainY(pt.x, pt.z, seaY);
-                float hLeft = SampleTerrainY(pt.x - (side.x * 55f), pt.z - (side.z * 55f), seaY);
-                float hRight = SampleTerrainY(pt.x + (side.x * 55f), pt.z + (side.z * 55f), seaY);
-                float h = Mathf.Max(hCenter, Mathf.Max(hLeft, hRight));
+                float h = SampleTerrainCached(pt.x, pt.z, seaY);
 
                 bool isLand = h > seaY + 0.5f;
                 overLand[i] = isLand;
@@ -2532,7 +2737,7 @@ namespace MDSFramework.Missiles
                 }
             }
 
-            float[] widthRatios = { 0.18f, 0.30f, 0.44f, 0.60f };
+            float[] widthRatios = { 0.24f, 0.48f };
             float minArcW = Mathf.Min(1100f, flatDist * 0.45f);
             float maxArcW = Mathf.Min(12000f, flatDist * 0.65f);
             int[] flankSigns = { 1, -1 };
@@ -2543,23 +2748,13 @@ namespace MDSFramework.Missiles
                 for (int r = 0; r < widthRatios.Length; r++)
                 {
                     float arcWidth = Mathf.Clamp(flatDist * widthRatios[r], minArcW, maxArcW);
-
-                    Vector3[] lateHook = BuildCubicBezierArc(
-                        startFlat, targetFlat, flatDir, side, flatDist, flankSign, arcWidth,
-                        0.34f, 0.85f, 0.80f, 1.00f);
+                    bool useDeep = r > 0 && flatDist >= 4500f;
+                    Vector3[] arc = useDeep
+                        ? BuildCubicBezierArc(startFlat, targetFlat, flatDir, side, flatDist, flankSign, arcWidth, 0.28f, 0.98f, 0.88f, 1.02f)
+                        : BuildCubicBezierArc(startFlat, targetFlat, flatDir, side, flatDist, flankSign, arcWidth, 0.34f, 0.85f, 0.80f, 1.00f);
                     EvaluateFlankingCandidate(
-                        lateHook, flankSign, seaY, targetFlat, flatDist, salvoTieBreakSign, hasVelDir, currentVelFlat,
+                        arc, flankSign, seaY, targetFlat, flatDist, salvoTieBreakSign, hasVelDir, currentVelFlat,
                         ref bestCost, ref bestRoute, ref bestFlankSign);
-
-                    if (flatDist >= 4500f)
-                    {
-                        Vector3[] deepBypass = BuildCubicBezierArc(
-                            startFlat, targetFlat, flatDir, side, flatDist, flankSign, arcWidth,
-                            0.28f, 0.98f, 0.88f, 1.02f);
-                        EvaluateFlankingCandidate(
-                            deepBypass, flankSign, seaY, targetFlat, flatDist, salvoTieBreakSign, hasVelDir, currentVelFlat,
-                            ref bestCost, ref bestRoute, ref bestFlankSign);
-                    }
                 }
             }
 
@@ -2568,7 +2763,7 @@ namespace MDSFramework.Missiles
                 float peakFrac = Mathf.Clamp(Vector3.Dot(peakPos - startFlat, flatDir) / flatDist, 0.20f, 0.80f);
                 float t1Peak = peakFrac * 0.70f;
                 float t2Peak = Mathf.Clamp(peakFrac * 1.25f, 0.55f, 0.88f);
-                float[] peakOffsets = { 2000f, 4000f, 6800f, 9500f };
+                float[] peakOffsets = { 3200f, 7200f };
 
                 for (int fs = 0; fs < flankSigns.Length; fs++)
                 {
@@ -2655,7 +2850,7 @@ namespace MDSFramework.Missiles
             float w1,
             float t2,
             float w2,
-            int segments = 8)
+            int segments = 5)
         {
             Vector3 p0 = startFlat;
             Vector3 p1 = startFlat + (flatDir * (flatDist * t1)) + (side * (flankSign * arcWidth * w1));
@@ -2686,7 +2881,7 @@ namespace MDSFramework.Missiles
             maxElevAboveSea = 0f;
             peakPos = waypoints[0];
             float cost = 0f;
-            const float probeStep = 300f;
+            const float probeStep = 1350f;
             const float targetExclusionSq = 650f * 650f;
             int aaCount = hostileAaThreats.Count;
 
@@ -2703,17 +2898,14 @@ namespace MDSFramework.Missiles
                 }
 
                 Vector3 dir = d / segLen;
-                Vector3 side = Vector3.Cross(Vector3.up, dir).normalized;
                 int steps = Mathf.Max(1, Mathf.CeilToInt(segLen / probeStep));
                 float stepDist = segLen / steps;
 
                 for (int s = 0; s <= steps; s++)
                 {
                     Vector3 pt = a + (dir * (stepDist * s));
-                    float hC = SampleTerrainY(pt.x, pt.z, seaY);
-                    float hL = SampleTerrainY(pt.x - (side.x * 60f), pt.z - (side.z * 60f), seaY);
-                    float hR = SampleTerrainY(pt.x + (side.x * 60f), pt.z + (side.z * 60f), seaY);
-                    float elev = Mathf.Max(0f, Mathf.Max(hC, Mathf.Max(hL, hR)) - seaY);
+                    float hC = SampleTerrainCached(pt.x, pt.z, seaY);
+                    float elev = Mathf.Max(0f, hC - seaY);
 
                     if (elev > maxElevAboveSea)
                     {
@@ -2768,6 +2960,27 @@ namespace MDSFramework.Missiles
 
             cost += maxElevAboveSea * 45f;
             return cost;
+        }
+
+        private static float SampleTerrainCached(float x, float z, float seaY)
+        {
+            if (float.IsNaN(cachedTerrainSeaY) || Mathf.Abs(cachedTerrainSeaY - seaY) > 0.5f || TerrainHeightCache.Count > 32768)
+            {
+                TerrainHeightCache.Clear();
+                cachedTerrainSeaY = seaY;
+            }
+
+            int gx = Mathf.RoundToInt(x / TerrainCacheCellMeters);
+            int gz = Mathf.RoundToInt(z / TerrainCacheCellMeters);
+            long key = ((long)gx << 32) | (uint)gz;
+            if (TerrainHeightCache.TryGetValue(key, out float cached))
+            {
+                return cached;
+            }
+
+            float sampled = SampleTerrainY(gx * TerrainCacheCellMeters, gz * TerrainCacheCellMeters, seaY);
+            TerrainHeightCache[key] = sampled;
+            return sampled;
         }
 
         private static float SampleTerrainY(float x, float z, float seaY)
@@ -2995,7 +3208,7 @@ namespace MDSFramework.Missiles
                     continue;
                 }
 
-                bool isJamTarget = u is Ship || u is Missile || (u is Building && u.HasRadarEmission());
+                bool isJamTarget = u is Ship || u is Missile || ((u is Building || u is GroundVehicle) && u.HasRadarEmission());
                 if (!isJamTarget)
                 {
                     continue;
@@ -3054,7 +3267,12 @@ namespace MDSFramework.Missiles
 
         private void CheckAbmIntercept()
         {
-            if (interceptedTarget || TargetUnit is not Missile targetMissile || targetMissile.disabled)
+            if (!GameInteropHelpers.IsServerAuthority() ||
+                interceptedTarget ||
+                ageSeconds <= 0.25f ||
+                !Missile.IsArmed() ||
+                TargetUnit is not Missile targetMissile ||
+                targetMissile.disabled)
             {
                 return;
             }
@@ -3084,14 +3302,19 @@ namespace MDSFramework.Missiles
 
             interceptedTarget = true;
             float altAboveSea = currTargetPos.y - Datum.LocalSeaY;
-            bool highAltitude = altAboveSea >= Spec.HighAltitudeInterceptMinMeters;
-
-            if (MdsConfig.EnableHighAltitudeDisarm.Value && highAltitude && Spec.DisarmTargetWarheadOnIntercept)
+            if (Spec.DisarmTargetWarheadOnIntercept)
             {
                 bool disarmed = GameInteropHelpers.SafeDisarmWarhead(targetMissile);
                 MdsLog.Info(
                     $"[ABM] '{Spec.DisplayName}' intercepted '{targetMissile.unitName}' at {altAboveSea:0} m " +
                     $"(warheadArmed={!disarmed}).");
+            }
+
+            PersistentID creditId = Missile.ownerID.IsValid ? Missile.ownerID : Missile.persistentID;
+            if (creditId.IsValid)
+            {
+                targetMissile.RecordDamage(creditId, 1000f);
+                targetMissile.ReportKilled();
             }
 
             // Neutralize incoming warhead cleanly without nuclear detonation.

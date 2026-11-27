@@ -22,10 +22,30 @@ namespace MDSFramework.Patches
         }
     }
 
+    [HarmonyPatch(typeof(Aircraft), nameof(Aircraft.AddECMIntensity), new[] { typeof(float) })]
+    internal static class AircraftAddEcmIntensityPatch
+    {
+        private static void Postfix(Aircraft __instance, float ecmIntensity)
+        {
+            if (!GameInteropHelpers.IsServerAuthority() ||
+                !MdsConfig.EnableEccmNetwork.Value ||
+                __instance == null ||
+                __instance.disabled)
+            {
+                return;
+            }
+
+            if (ecmIntensity > 0.05f || (__instance.GetECMIntensity() > 0.05f && ecmIntensity >= 0f))
+            {
+                SensorNetworkManager.Instance?.RecordPassiveEcmPulse(__instance);
+            }
+        }
+    }
+
     [HarmonyPatch(typeof(Radar), "Radar_OnJam")]
     internal static class RadarOnJamPatch
     {
-        private static bool Prefix(Radar __instance, ref Unit.JamEventArgs e)
+        private static bool Prefix(Radar __instance)
         {
             if (!MdsConfig.EnableEccmNetwork.Value || __instance == null)
             {
@@ -42,33 +62,13 @@ namespace MDSFramework.Patches
             if (site != null && site.Spec.SensorProfile != null)
             {
                 // Active EMCON or stowed radar ignores jamming accumulation completely.
-                if (!site.IsRadarEmitting)
-                {
-                    return false;
-                }
-
-                float tol = Mathf.Clamp(site.Spec.SensorProfile.JamTolerance + site.EffectiveNetworkEccmBonus, 0f, 0.92f);
-                if (tol > 0.05f)
-                {
-                    e.jamAmount *= Mathf.Clamp(1f - (tol * 0.75f), 0.08f, 1f);
-                }
-
-                return true;
+                return site.IsRadarEmitting;
             }
 
             MdsClientSiteProxy? proxy = owner.GetComponent<MdsClientSiteProxy>();
             if (proxy != null && proxy.Spec.SensorProfile != null)
             {
-                if (!proxy.IsRadarEmitting)
-                {
-                    return false;
-                }
-
-                float tol = Mathf.Clamp(proxy.Spec.SensorProfile.JamTolerance, 0f, 0.92f);
-                if (tol > 0.05f)
-                {
-                    e.jamAmount *= Mathf.Clamp(1f - (tol * 0.75f), 0.08f, 1f);
-                }
+                return proxy.IsRadarEmitting;
             }
 
             return true;
@@ -92,7 +92,7 @@ namespace MDSFramework.Patches
             }
 
             ModularSiteBehavior? site = owner.GetComponent<ModularSiteBehavior>();
-            if (site == null || !site.IsRadarEmitting)
+            if (site == null || !site.IsRadarEmitting || site.Spec.SensorProfile == null)
             {
                 return;
             }
@@ -108,6 +108,12 @@ namespace MDSFramework.Patches
                 return;
             }
 
+            float rcs = Mathf.Max(0.005f, targetUnit.RCS);
+            if (rcs < 0.02f)
+            {
+                return;
+            }
+
             Transform scannerTf = (GameInteropHelpers.TargetDetectorScannerField?.GetValue(__instance) as Transform)
                                   ?? __instance.transform;
             float h1 = Mathf.Max(1f, scannerTf.position.y - Datum.LocalSeaY);
@@ -118,8 +124,16 @@ namespace MDSFramework.Patches
                 return;
             }
 
-            float vhfEnvelope = Mathf.Max(20000f, site.Spec.SensorProfile.DetectionRangeKm * 1000f);
-            if (dist <= vhfEnvelope && !__instance.IsJammed() && clutterFactor < 1.8f)
+            float baseEnvelope = Mathf.Max(20000f, site.Spec.SensorProfile.DetectionRangeKm * 1000f);
+            float rcsScale = Mathf.Clamp(Mathf.Pow(rcs / 1.0f, 0.25f), 0.25f, 1.0f);
+            float clutterPenalty = 1f - Mathf.Clamp01(clutterFactor * 0.20f);
+            float vhfEnvelope = baseEnvelope * rcsScale * clutterPenalty;
+            if (targetUnit is Missile && rcs < 0.25f)
+            {
+                vhfEnvelope = Mathf.Min(vhfEnvelope, 12000f);
+            }
+
+            if (dist <= vhfEnvelope && !__instance.IsJammed() && clutterFactor < 1.35f)
             {
                 __result = true;
             }

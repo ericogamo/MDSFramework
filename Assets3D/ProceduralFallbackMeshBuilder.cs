@@ -93,8 +93,8 @@ namespace MDSFramework.Assets3D
 
             if (!string.IsNullOrEmpty(decalPngPath))
             {
-                AddNode(model, "Stencil_L", 6, new Vector3(-0.065f, 1.05f, 0f), Quaternion.Euler(0f, -90f, 0f), nWallL);
-                AddNode(model, "Stencil_R", 6, new Vector3(0.065f, 1.05f, 0f), Quaternion.Euler(0f, 90f, 0f), nWallR);
+                AddNode(model, "Stencil_L", 6, new Vector3(-0.065f, 1.05f, 0f), Quaternion.Euler(0f, 90f, 0f), nWallL);
+                AddNode(model, "Stencil_R", 6, new Vector3(0.065f, 1.05f, 0f), Quaternion.Euler(0f, -90f, 0f), nWallR);
             }
 
             _ = nChassis;
@@ -182,8 +182,8 @@ namespace MDSFramework.Assets3D
 
             if (!string.IsNullOrEmpty(decalPngPath))
             {
-                AddNode(model, "SideDecal_L", 6, new Vector3(-0.195f, 0f, -0.20f), Quaternion.Euler(0f, -90f, 0f), nRoot);
-                AddNode(model, "SideDecal_R", 6, new Vector3(0.195f, 0f, -0.20f), Quaternion.Euler(0f, 90f, 0f), nRoot);
+                AddNode(model, "SideDecal_L", 6, new Vector3(-0.195f, 0f, -0.20f), Quaternion.Euler(0f, 90f, 0f), nRoot);
+                AddNode(model, "SideDecal_R", 6, new Vector3(0.195f, 0f, -0.20f), Quaternion.Euler(0f, -90f, 0f), nRoot);
             }
 
             model.RootNodeIndices.Add(nRoot);
@@ -256,8 +256,8 @@ namespace MDSFramework.Assets3D
 
             if (!string.IsNullOrEmpty(decalPngPath))
             {
-                AddNode(model, "VLogo_L", 4, new Vector3(-0.23f, 0f, 0.80f), Quaternion.Euler(0f, -90f, 0f), nRoot);
-                AddNode(model, "VLogo_R", 4, new Vector3(0.23f, 0f, 0.80f), Quaternion.Euler(0f, 90f, 0f), nRoot);
+                AddNode(model, "VLogo_L", 4, new Vector3(-0.23f, 0f, 0.80f), Quaternion.Euler(0f, 90f, 0f), nRoot);
+                AddNode(model, "VLogo_R", 4, new Vector3(0.23f, 0f, 0.80f), Quaternion.Euler(0f, -90f, 0f), nRoot);
             }
 
             model.RootNodeIndices.Add(nRoot);

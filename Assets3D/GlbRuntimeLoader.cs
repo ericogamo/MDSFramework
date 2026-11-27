@@ -891,12 +891,6 @@ namespace MDSFramework.Assets3D
                         continue;
                     }
 
-                    float clipEnd = times[times.Length - 1];
-                    if (clipEnd > clip.Duration)
-                    {
-                        clip.Duration = clipEnd;
-                    }
-
                     string interpStr = samplerObj["interpolation"]?.Value<string>() ?? "LINEAR";
                     GlbInterpolationMode interp = string.Equals(interpStr, "STEP", StringComparison.OrdinalIgnoreCase)
                         ? GlbInterpolationMode.Step
@@ -911,24 +905,39 @@ namespace MDSFramework.Assets3D
                         Times = times
                     };
 
+                    bool hasValues;
                     if (string.Equals(pathStr, "translation", StringComparison.OrdinalIgnoreCase))
                     {
                         chanData.Path = GlbAnimationPath.Translation;
                         chanData.Vec3Values = ReadVec3Array(outputAcc.Value, accessors, bufferViews, binChunk, negateX: true);
+                        hasValues = chanData.Vec3Values.Length > 0;
                     }
                     else if (string.Equals(pathStr, "scale", StringComparison.OrdinalIgnoreCase))
                     {
                         chanData.Path = GlbAnimationPath.Scale;
                         chanData.Vec3Values = ReadVec3Array(outputAcc.Value, accessors, bufferViews, binChunk, negateX: false);
+                        hasValues = chanData.Vec3Values.Length > 0;
                     }
                     else if (string.Equals(pathStr, "rotation", StringComparison.OrdinalIgnoreCase))
                     {
                         chanData.Path = GlbAnimationPath.Rotation;
                         chanData.QuatValues = ReadQuatArray(outputAcc.Value, accessors, bufferViews, binChunk);
+                        hasValues = chanData.QuatValues.Length > 0;
                     }
                     else
                     {
                         continue;
+                    }
+
+                    if (!hasValues)
+                    {
+                        continue;
+                    }
+
+                    float clipEnd = times[times.Length - 1];
+                    if (clipEnd > clip.Duration)
+                    {
+                        clip.Duration = clipEnd;
                     }
 
                     clip.Channels.Add(chanData);
@@ -963,6 +972,11 @@ namespace MDSFramework.Assets3D
                 scale = new Vector3(sx.magnitude, sy.magnitude, sz.magnitude);
                 if (scale.x > 0.0001f && scale.y > 0.0001f && scale.z > 0.0001f)
                 {
+                    if (Vector3.Dot(Vector3.Cross(sx, sy), sz) < 0f)
+                    {
+                        scale.x = -scale.x;
+                    }
+
                     rot = Quaternion.LookRotation(sz / scale.z, sy / scale.y);
                 }
                 else
@@ -1009,10 +1023,37 @@ namespace MDSFramework.Assets3D
             var bounds = new Bounds();
             bool hasBounds = false;
             var visited = new HashSet<int>();
+            int nodeCount = model.Nodes.Count;
+            var hasParent = new bool[nodeCount];
+            for (int i = 0; i < nodeCount; i++)
+            {
+                GlbNodeData nodeData = model.Nodes[i];
+                for (int c = 0; c < nodeData.Children.Count; c++)
+                {
+                    int childIdx = nodeData.Children[c];
+                    if (childIdx >= 0 && childIdx < nodeCount && childIdx != i)
+                    {
+                        hasParent[childIdx] = true;
+                    }
+                }
+            }
 
+            var traversedRoots = new HashSet<int>();
             for (int r = 0; r < model.RootNodeIndices.Count; r++)
             {
-                AccumulateNodeBounds(model, model.RootNodeIndices[r], Matrix4x4.identity, visited, 0, ref bounds, ref hasBounds);
+                int rootIdx = model.RootNodeIndices[r];
+                if (rootIdx >= 0 && rootIdx < nodeCount && !hasParent[rootIdx] && traversedRoots.Add(rootIdx))
+                {
+                    AccumulateNodeBounds(model, rootIdx, Matrix4x4.identity, visited, 0, ref bounds, ref hasBounds);
+                }
+            }
+
+            for (int i = 0; i < nodeCount; i++)
+            {
+                if (!hasParent[i] && traversedRoots.Add(i))
+                {
+                    AccumulateNodeBounds(model, i, Matrix4x4.identity, visited, 0, ref bounds, ref hasBounds);
+                }
             }
 
             if (!hasBounds)
@@ -1092,7 +1133,7 @@ namespace MDSFramework.Assets3D
                 }
             }
 
-            return clips.Count > 0 ? clips[0] : null;
+            return null;
         }
 
         private static GlbAnimationClipData? SelectClipByKeyword(List<GlbAnimationClipData> clips, string keyword)
@@ -1295,8 +1336,9 @@ namespace MDSFramework.Assets3D
 
         private static Vector3[] ReadVec3Array(int accessorIndex, JArray accessors, JArray bufferViews, byte[] bin, bool negateX)
         {
-            if (!TryResolveAccessor(accessorIndex, accessors, bufferViews, bin, out int count, out int compType, out _, out int baseOffset, out int stride) ||
-                compType != 5126)
+            if (!TryResolveAccessor(accessorIndex, accessors, bufferViews, bin, out int count, out int compType, out string type, out int baseOffset, out int stride) ||
+                compType != 5126 ||
+                (!string.IsNullOrEmpty(type) && !string.Equals(type, "VEC3", StringComparison.Ordinal)))
             {
                 return Array.Empty<Vector3>();
             }
@@ -1323,19 +1365,34 @@ namespace MDSFramework.Assets3D
 
         private static Quaternion[] ReadQuatArray(int accessorIndex, JArray accessors, JArray bufferViews, byte[] bin)
         {
-            if (!TryResolveAccessor(accessorIndex, accessors, bufferViews, bin, out int count, out int compType, out _, out int baseOffset, out int stride))
+            if (!TryResolveAccessor(accessorIndex, accessors, bufferViews, bin, out int count, out int compType, out string type, out int baseOffset, out int stride))
             {
                 return Array.Empty<Quaternion>();
             }
 
-            if (compType != 5126)
+            if (!string.IsNullOrEmpty(type) && !string.Equals(type, "VEC4", StringComparison.Ordinal))
             {
                 return Array.Empty<Quaternion>();
             }
 
-            int elemStride = stride > 0 ? stride : 16;
-            long endByte = (long)baseOffset + ((long)(count - 1) * elemStride) + 16;
-            if (elemStride < 16 || endByte < 0 || endByte > bin.Length)
+            int compBytes = compType switch
+            {
+                5120 => 1,
+                5121 => 1,
+                5122 => 2,
+                5123 => 2,
+                5126 => 4,
+                _ => 0
+            };
+            if (compBytes == 0)
+            {
+                return Array.Empty<Quaternion>();
+            }
+
+            int elemBytes = 4 * compBytes;
+            int elemStride = stride > 0 ? stride : elemBytes;
+            long endByte = (long)baseOffset + ((long)(count - 1) * elemStride) + elemBytes;
+            if (elemStride < elemBytes || endByte < 0 || endByte > bin.Length)
             {
                 return Array.Empty<Quaternion>();
             }
@@ -1344,16 +1401,29 @@ namespace MDSFramework.Assets3D
             for (int i = 0; i < count; i++)
             {
                 int pos = baseOffset + (i * elemStride);
-                float x = BitConverter.ToSingle(bin, pos);
-                float y = BitConverter.ToSingle(bin, pos + 4);
-                float z = BitConverter.ToSingle(bin, pos + 8);
-                float w = BitConverter.ToSingle(bin, pos + 12);
+                float x = ReadQuatComponent(bin, pos, compType);
+                float y = ReadQuatComponent(bin, pos + compBytes, compType);
+                float z = ReadQuatComponent(bin, pos + (2 * compBytes), compType);
+                float w = ReadQuatComponent(bin, pos + (3 * compBytes), compType);
                 var q = new Quaternion(x, -y, -z, w);
                 float sqr = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
                 result[i] = sqr > 0.00001f ? Quaternion.Normalize(q) : Quaternion.identity;
             }
 
             return result;
+        }
+
+        private static float ReadQuatComponent(byte[] bin, int pos, int compType)
+        {
+            return compType switch
+            {
+                5120 => Mathf.Max(unchecked((sbyte)bin[pos]) / 127f, -1f),
+                5121 => bin[pos] / 255f,
+                5122 => Mathf.Max(BitConverter.ToInt16(bin, pos) / 32767f, -1f),
+                5123 => BitConverter.ToUInt16(bin, pos) / 65535f,
+                5126 => BitConverter.ToSingle(bin, pos),
+                _ => 0f
+            };
         }
 
         private static Vector2[] ReadVec2Array(int accessorIndex, JArray accessors, JArray bufferViews, byte[] bin)

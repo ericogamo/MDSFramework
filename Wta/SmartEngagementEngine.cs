@@ -31,9 +31,12 @@ namespace MDSFramework.Wta
         private readonly WeaponCascadeRole[] effectiveCascadeScratch = new WeaponCascadeRole[12];
         private readonly bool[] aimedThisTick = new bool[MaxEffectors];
         private readonly bool[] effectorUsedThisTick = new bool[MaxEffectors];
+        private readonly int[] effectorAssignedThreatScratch = new int[MaxEffectors];
         private readonly int[] threatOrderScratch = new int[MaxThreats];
         private readonly int[] closeInAssignedThisTick = new int[MaxThreats];
         private readonly ModularSiteBehavior?[] firstNetShooterScratch = new ModularSiteBehavior?[MaxThreats];
+        private readonly HashSet<int> helBeamedSiteInstancesThisTick = new HashSet<int>();
+        private readonly Dictionary<int, float> helCapacitorRechargeAccumBySiteInstance = new Dictionary<int, float>(16);
 
         internal int LastThreatCount { get; private set; }
         internal int LastOrderCount { get; private set; }
@@ -48,12 +51,15 @@ namespace MDSFramework.Wta
         {
             Array.Clear(threatUnitBuffer, 0, threatUnitBuffer.Length);
             Array.Clear(effectorSiteBuffer, 0, effectorSiteBuffer.Length);
+            Array.Clear(effectorAssignedThreatScratch, 0, effectorAssignedThreatScratch.Length);
             seenUnitToThreatIndex.Clear();
             activeCustomMissilesByTarget.Clear();
             activeHojMissilesByTarget.Clear();
             nextTickTimeByFaction.Clear();
             lastTickTimeByFaction.Clear();
             activeStateByFaction.Clear();
+            helBeamedSiteInstancesThisTick.Clear();
+            helCapacitorRechargeAccumBySiteInstance.Clear();
             LastThreatCount = 0;
             LastOrderCount = 0;
             AnyFactionActive = false;
@@ -156,6 +162,10 @@ namespace MDSFramework.Wta
                     hasAntiVehicleEffector = true;
                 }
 
+                bool hasAmmo = site.Spec.Role == WeaponCascadeRole.LaserHel
+                    ? (site.PrimaryMagazineSize <= 0 || site.PrimaryAmmoRemaining > 0)
+                    : site.AmmoRemaining > 0;
+
                 effectorSiteBuffer[effectorCount] = site;
                 effectorBuffer[effectorCount] = new EffectorSnapshot
                 {
@@ -166,8 +176,7 @@ namespace MDSFramework.Wta
                     MaxRangeMeters = maxRange,
                     FullMaxRangeMeters = fullMaxRange,
                     IsDeployed = site.IsDeployed,
-                    IsReadyToFire = site.IsDeployed && !site.IsVehicleMoving && site.CooldownRemaining <= 0.01f &&
-                                    (site.Spec.Role == WeaponCascadeRole.LaserHel || site.AmmoRemaining > 0),
+                    IsReadyToFire = site.IsDeployed && !site.IsVehicleMoving && site.CooldownRemaining <= 0.01f && hasAmmo,
                     HasFcuGuidance = site.HasFireControlGuidance,
                     HasPassiveHojMissile = SiteHasReadyPassiveHojMissile(site),
                     EoIrBackupRangeMeters = eoirBackup,
@@ -210,7 +219,9 @@ namespace MDSFramework.Wta
             int threatCount = GatherThreatsForFaction(faction, myHq, allSites, hasAntiVehicleEffector, now);
 
             bool hasNearThreats = UpdateAutoPopUpAndStow(allSites, faction, profile, threatCount, now);
-            bool activeMode = threatCount > 0 && hasNearThreats;
+            bool hasActiveHoj = SensorNetworkManager.Instance != null &&
+                                SensorNetworkManager.Instance.HasActiveHojTrackForFaction(faction);
+            bool activeMode = (threatCount > 0 && hasNearThreats) || hasActiveHoj;
             activeStateByFaction[faction] = activeMode;
             if (activeMode)
             {
@@ -229,6 +240,7 @@ namespace MDSFramework.Wta
             nextTickTimeByFaction[faction] = now + dtStep;
             anyEvaluated = true;
 
+            helBeamedSiteInstancesThisTick.Clear();
             int orderCount = 0;
             if (threatCount > 0 && effectorCount > 0)
             {
@@ -239,6 +251,8 @@ namespace MDSFramework.Wta
             {
                 ClearIdleEffectors(effectorCount);
             }
+
+            RechargeIdleHelCapacitors(effectorCount, actualDt);
 
             totalThreats += threatCount;
             totalOrders += orderCount;
@@ -445,12 +459,24 @@ namespace MDSFramework.Wta
                     if (seenUnitToThreatIndex.TryGetValue(idKey, out int idx))
                     {
                         ThreatSnapshot existing = threatBuffer[idx];
-                        existing.IsJammer = true;
-                        existing.IsActivelyJamming = true;
-                        existing.IsJammingFriendlyFcu |= entry.VictimIsRadarOrFcu;
-                        existing.WorldPos = entry.TriangulatedWorldPos;
-                        existing.Velocity = entry.Velocity;
-                        existing.PriorityScore += entry.VictimIsRadarOrFcu ? 85f : 45f;
+                        if (!existing.IsJammer)
+                        {
+                            existing.IsJammer = true;
+                            existing.PriorityScore += 40f;
+                        }
+
+                        if (!existing.IsActivelyJamming)
+                        {
+                            existing.IsActivelyJamming = true;
+                            existing.IsJammingFriendlyFcu = entry.VictimIsRadarOrFcu;
+                            existing.PriorityScore += entry.VictimIsRadarOrFcu ? 85f : 45f;
+                        }
+                        else if (!existing.IsJammingFriendlyFcu && entry.VictimIsRadarOrFcu)
+                        {
+                            existing.IsJammingFriendlyFcu = true;
+                            existing.PriorityScore += 40f;
+                        }
+
                         threatBuffer[idx] = existing;
                     }
                     else
@@ -827,6 +853,15 @@ namespace MDSFramework.Wta
                 effectiveExistingAttacks = customInFlight;
             }
 
+            if (target.persistentID.IsValid && RtsBridgeHost.QueryActiveAbmInterceptorsForThreat != null)
+            {
+                int rtsAbmInFlight = RtsBridgeHost.QueryActiveAbmInterceptorsForThreat(target.persistentID);
+                if (rtsAbmInFlight > effectiveExistingAttacks)
+                {
+                    effectiveExistingAttacks = rtsAbmInFlight;
+                }
+            }
+
             int activeHojInFlight = 0;
             if (target.persistentID.IsValid)
             {
@@ -958,6 +993,8 @@ namespace MDSFramework.Wta
             {
                 ModularSiteBehavior site = allSites[i];
                 if (!site.IsAlive ||
+                    site.SuspendedInTransit ||
+                    !site.IsDeployed ||
                     (site.IsCommandCenter && !SensorBandPhysics.HasBand(site.SupportedBandMask, SensorBand.PassiveElint)) ||
                     site.Faction != faction ||
                     site.Unit == null ||
@@ -998,7 +1035,6 @@ namespace MDSFramework.Wta
             float now)
         {
             float popUpRangeM = Mathf.Max(2000f, profile.AutoPopUpRangeKm * 1000f);
-            float popUpSq = popUpRangeM * popUpRangeM;
             bool anyNearThreat = false;
 
             for (int i = 0; i < allSites.Count; i++)
@@ -1053,13 +1089,33 @@ namespace MDSFramework.Wta
 
                 bool nearSite = false;
 
-                // Keep ABM/HoJ VLS deployed whenever an active ballistic/nuclear warning or HoJ jammer track threatens this faction.
-                if ((site.Spec.Role == WeaponCascadeRole.AbmVls &&
-                     AbmEarlyWarningService.Instance != null &&
-                     AbmEarlyWarningService.Instance.HasActiveWarningForFaction(faction)) ||
-                    (SiteHasReadyPassiveHojMissile(site) &&
-                     SensorNetworkManager.Instance != null &&
-                     SensorNetworkManager.Instance.HasActiveHojTrackForFaction(faction)))
+                // Keep ABM VLS deployed for active ballistic/nuclear warnings, and HoJ VLS deployed when a jammer is within engagement watch range.
+                bool abmPopUp = site.Spec.Role == WeaponCascadeRole.AbmVls &&
+                                AbmEarlyWarningService.Instance != null &&
+                                AbmEarlyWarningService.Instance.HasActiveWarningForFaction(faction);
+
+                bool hojPopUp = false;
+                if (!abmPopUp && SiteHasReadyPassiveHojMissile(site) && SensorNetworkManager.Instance != null)
+                {
+                    float hojWatchRangeM = Mathf.Max(2000f, site.Spec.MaxEngagementRangeKm * 1050f);
+                    float hojWatchSq = hojWatchRangeM * hojWatchRangeM;
+                    IReadOnlyList<HojTrackEntry> hojTracks = SensorNetworkManager.Instance.ActiveHojTracks;
+                    for (int h = 0; h < hojTracks.Count; h++)
+                    {
+                        HojTrackEntry entry = hojTracks[h];
+                        if (entry.Faction == faction &&
+                            entry.JammerUnit != null &&
+                            !entry.JammerUnit.disabled &&
+                            SensorNetworkManager.Instance.IsUnitActivelyEmittingEcm(entry.JammerUnit) &&
+                            (entry.TriangulatedWorldPos - sitePos).sqrMagnitude <= hojWatchSq)
+                        {
+                            hojPopUp = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (abmPopUp || hojPopUp)
                 {
                     nearSite = true;
                 }
@@ -1091,7 +1147,8 @@ namespace MDSFramework.Wta
                 }
                 else
                 {
-                    float siteWatchSq = Mathf.Max(popUpSq, Mathf.Pow(site.Spec.MaxEngagementRangeKm * 1150f, 2f));
+                    float siteWatchRangeM = Mathf.Min(popUpRangeM, Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1250f));
+                    float siteWatchSq = siteWatchRangeM * siteWatchRangeM;
                     float groundWatchSq = Mathf.Pow(Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1250f), 2f);
                     for (int t = 0; t < threatCount; t++)
                     {
@@ -1232,6 +1289,10 @@ namespace MDSFramework.Wta
             int orderCount = 0;
             Array.Clear(aimedThisTick, 0, effectorCount);
             Array.Clear(effectorUsedThisTick, 0, effectorCount);
+            for (int i = 0; i < effectorCount; i++)
+            {
+                effectorAssignedThreatScratch[i] = -1;
+            }
 
             bool hasNetworked = false;
             for (int e = 0; e < effectorCount; e++)
@@ -1272,7 +1333,10 @@ namespace MDSFramework.Wta
                             site.TurretAim?.HideBeam();
                         }
 
-                        if (site.Spec.VerticalLaunch || site.Spec.LaunchAlongSocketForward || (role != WeaponCascadeRole.LaserHel && site.AmmoRemaining <= 0))
+                        if (site.Spec.VerticalLaunch ||
+                            site.Spec.LaunchAlongSocketForward ||
+                            (role != WeaponCascadeRole.LaserHel && site.AmmoRemaining <= 0) ||
+                            (role == WeaponCascadeRole.LaserHel && site.PrimaryMagazineSize > 0 && site.PrimaryAmmoRemaining <= 0))
                         {
                             continue;
                         }
@@ -1288,6 +1352,10 @@ namespace MDSFramework.Wta
                                          role == WeaponCascadeRole.AbmVls ||
                                          role == WeaponCascadeRole.AntiShipCoastal ||
                                          role == WeaponCascadeRole.AntiVehicleDrone;
+                    Vector3 muzzlePos = GetMuzzleOrigin(site);
+                    bool alwaysRequireLos = role == WeaponCascadeRole.LaserHel ||
+                                            role == WeaponCascadeRole.CloseInGun ||
+                                            (isMissileRole && (site.EmconState == FcuEmconState.EoIrEmergencyOnly || site.Spec.LaunchAlongSocketForward));
 
                     for (int t = 0; t < threatCount; t++)
                     {
@@ -1326,6 +1394,13 @@ namespace MDSFramework.Wta
                         float distSq = (th.WorldPos - eff.WorldPos).sqrMagnitude;
                         if (distSq < eff.MinRangeMeters * eff.MinRangeMeters ||
                             distSq > allowedMaxRange * allowedMaxRange)
+                        {
+                            continue;
+                        }
+
+                        bool requireLos = alwaysRequireLos || (isMissileRole && !eff.HasFcuGuidance && !canBlindHoj);
+                        if (requireLos &&
+                            Physics.Linecast(muzzlePos, th.WorldPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                         {
                             continue;
                         }
@@ -1410,6 +1485,7 @@ namespace MDSFramework.Wta
                     {
                         site.TurretAim?.SetAimWorldPosition(threatBuffer[bestThreatIdx].WorldPos);
                         aimedThisTick[e] = true;
+                        effectorAssignedThreatScratch[e] = bestThreatIdx;
                         continue;
                     }
 
@@ -1444,6 +1520,7 @@ namespace MDSFramework.Wta
                     }
 
                     aimedThisTick[e] = true;
+                    effectorAssignedThreatScratch[e] = bestThreatIdx;
                     orderBuffer[orderCount++] = new EngagementOrder
                     {
                         EffectorSiteIndex = eff.SiteIndex,
@@ -1544,6 +1621,28 @@ namespace MDSFramework.Wta
 
             Array.Clear(firstNetShooterScratch, 0, threatCount);
 
+            // Pass 2B: Blind HoJ Counter-Jammer Guarantee — run before Pass 1 so VLS/HoJ shooters reserve
+            // a Passive HoJ shot for active jammers instead of expending secondary cells on routine threats.
+            for (int idx = 0; idx < threatCount && orderCount < MaxOrders; idx++)
+            {
+                int t = threatOrderScratch[idx];
+                ThreatSnapshot th = threatBuffer[t];
+                if (!th.IsActivelyJamming || th.ActiveHojMissileAttacks + th.AssignedHojThisTick >= 1)
+                {
+                    continue;
+                }
+
+                TryAssignNetworkedMissileForThreat(
+                    t,
+                    effectorCount,
+                    threatCount,
+                    profile,
+                    preferredDifferentFrom: null,
+                    ref orderCount,
+                    recordFirstShooter: th.ExistingMissileAttacks + th.AssignedThisTick == 0,
+                    forcePassiveHojOnly: true);
+            }
+
             // Pass 1: Coverage-First — at most 1 optimal missile shooter per currently unengaged threat.
             for (int idx = 0; idx < threatCount && orderCount < MaxOrders; idx++)
             {
@@ -1586,27 +1685,6 @@ namespace MDSFramework.Wta
                     preferredDifferentFrom: firstNetShooterScratch[t],
                     ref orderCount,
                     recordFirstShooter: false);
-            }
-
-            // Pass 2B: Blind HoJ Counter-Jammer Guarantee — ensure at least 1 Passive HoJ missile launches against any active jammer.
-            for (int idx = 0; idx < threatCount && orderCount < MaxOrders; idx++)
-            {
-                int t = threatOrderScratch[idx];
-                ThreatSnapshot th = threatBuffer[t];
-                if (!th.IsActivelyJamming || th.ActiveHojMissileAttacks + th.AssignedHojThisTick >= 1)
-                {
-                    continue;
-                }
-
-                TryAssignNetworkedMissileForThreat(
-                    t,
-                    effectorCount,
-                    threatCount,
-                    profile,
-                    preferredDifferentFrom: firstNetShooterScratch[t],
-                    ref orderCount,
-                    recordFirstShooter: false,
-                    forcePassiveHojOnly: true);
             }
 
             // Stage 3: Networked coastal anti-ship effectors vs surface ships (respecting warship salvo cap).
@@ -1819,7 +1897,8 @@ namespace MDSFramework.Wta
                         site.TurretAim?.HideBeam();
                     }
 
-                    if (role != WeaponCascadeRole.LaserHel && site.AmmoRemaining <= 0)
+                    if ((role != WeaponCascadeRole.LaserHel && site.AmmoRemaining <= 0) ||
+                        (role == WeaponCascadeRole.LaserHel && site.PrimaryMagazineSize > 0 && site.PrimaryAmmoRemaining <= 0))
                     {
                         continue;
                     }
@@ -1827,6 +1906,7 @@ namespace MDSFramework.Wta
 
                 int bestThreatIdx = -1;
                 float bestScore = float.MinValue;
+                Vector3 muzzlePos = GetMuzzleOrigin(site);
                 for (int t = 0; t < threatCount; t++)
                 {
                     ThreatSnapshot th = threatBuffer[t];
@@ -1844,6 +1924,11 @@ namespace MDSFramework.Wta
                     float distSq = (th.WorldPos - eff.WorldPos).sqrMagnitude;
                     if (distSq < eff.MinRangeMeters * eff.MinRangeMeters ||
                         distSq > eff.MaxRangeMeters * eff.MaxRangeMeters)
+                    {
+                        continue;
+                    }
+
+                    if (Physics.Linecast(muzzlePos, th.WorldPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                     {
                         continue;
                     }
@@ -1883,11 +1968,13 @@ namespace MDSFramework.Wta
                 {
                     site.TurretAim?.SetAimWorldPosition(threatBuffer[bestThreatIdx].WorldPos);
                     aimedThisTick[e] = true;
+                    effectorAssignedThreatScratch[e] = bestThreatIdx;
                     continue;
                 }
 
                 effectorUsedThisTick[e] = true;
                 aimedThisTick[e] = true;
+                effectorAssignedThreatScratch[e] = bestThreatIdx;
                 closeInAssignedThisTick[bestThreatIdx]++;
                 orderBuffer[orderCount++] = new EngagementOrder
                 {
@@ -1956,6 +2043,14 @@ namespace MDSFramework.Wta
                 float distSq = relPos.sqrMagnitude;
                 if (distSq < eff.MinRangeMeters * eff.MinRangeMeters ||
                     distSq > allowedMaxRange * allowedMaxRange)
+                {
+                    continue;
+                }
+
+                if ((site.EmconState == FcuEmconState.EoIrEmergencyOnly ||
+                     site.Spec.LaunchAlongSocketForward ||
+                     (!eff.HasFcuGuidance && !canBlindHoj)) &&
+                    Physics.Linecast(GetMuzzleOrigin(site), th.WorldPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                 {
                     continue;
                 }
@@ -2068,8 +2163,19 @@ namespace MDSFramework.Wta
                 return;
             }
 
+            if (!bestSite.Spec.VerticalLaunch && !bestSite.Spec.LaunchAlongSocketForward && bestSite.TurretAim != null)
+            {
+                bestSite.TurretAim.SetAimWorldPosition(th.WorldPos);
+                aimedThisTick[bestE] = true;
+                if (!bestSite.TurretAim.IsOnTarget)
+                {
+                    return;
+                }
+            }
+
             effectorUsedThisTick[bestE] = true;
             aimedThisTick[bestE] = true;
+            effectorAssignedThreatScratch[bestE] = threatIdx;
             if (recordFirstShooter)
             {
                 firstNetShooterScratch[threatIdx] = bestSite;
@@ -2083,15 +2189,6 @@ namespace MDSFramework.Wta
             }
 
             threatBuffer[threatIdx] = updated;
-
-            if (!bestSite.Spec.VerticalLaunch && bestSite.TurretAim != null)
-            {
-                bestSite.TurretAim.SetAimWorldPosition(th.WorldPos);
-                if (!bestSite.TurretAim.IsOnTarget)
-                {
-                    return;
-                }
-            }
 
             orderBuffer[orderCount++] = new EngagementOrder
             {
@@ -2322,6 +2419,7 @@ namespace MDSFramework.Wta
             bool includeGuns,
             float trajectoryPaddingMeters)
         {
+            _ = trajectoryPaddingMeters;
             float velSq = th.Velocity.sqrMagnitude;
             for (int i = 0; i < effectorCount; i++)
             {
@@ -2332,33 +2430,80 @@ namespace MDSFramework.Wta
                     continue;
                 }
 
+                if (!cand.IsDeployed)
+                {
+                    continue;
+                }
+
                 ModularSiteBehavior? candSite = effectorSiteBuffer[i];
-                if (candSite == null || !candSite.IsAlive || candSite.IsHoldFireActive)
+                if (candSite == null ||
+                    !candSite.IsAlive ||
+                    candSite.IsHoldFireActive ||
+                    candSite.IsVehicleMoving ||
+                    candSite.SuspendedInTransit)
                 {
                     continue;
                 }
 
-                if (cand.Role != WeaponCascadeRole.LaserHel && candSite.AmmoRemaining <= 0)
+                if (cand.Role == WeaponCascadeRole.LaserHel)
+                {
+                    if (candSite.PrimaryMagazineSize > 0 && candSite.PrimaryAmmoRemaining <= 0)
+                    {
+                        continue;
+                    }
+                }
+                else if (candSite.AmmoRemaining <= 0)
                 {
                     continue;
                 }
 
-                float coverRadius = cand.MaxRangeMeters + Mathf.Max(0f, trajectoryPaddingMeters);
+                if (candSite.CooldownRemaining > 1.5f)
+                {
+                    continue;
+                }
+
+                // Ignore close-in sites already saturated by an engagement against a different threat.
+                if (effectorAssignedThreatScratch[i] >= 0 && effectorAssignedThreatScratch[i] != th.UnitIndex)
+                {
+                    continue;
+                }
+
+                if (cand.Role == WeaponCascadeRole.LaserHel &&
+                    candSite.ActiveHelTargetId.IsValid &&
+                    candSite.ActiveHelDwellSeconds > 0f &&
+                    !candSite.ActiveHelTargetId.Equals(th.UnitId))
+                {
+                    continue;
+                }
+
+                float coverRadius = cand.MaxRangeMeters * 0.9f;
                 float coverSq = coverRadius * coverRadius;
                 Vector3 relPos = th.WorldPos - cand.WorldPos;
+                Vector3 muzzleOrigin = GetMuzzleOrigin(candSite);
+                bool withinCover = false;
+
                 if (relPos.sqrMagnitude <= coverSq)
                 {
-                    return true;
+                    withinCover = !Physics.Linecast(muzzleOrigin, th.WorldPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore);
+                }
+                else if (velSq > 1f)
+                {
+                    float tCpa = Mathf.Clamp(-Vector3.Dot(relPos, th.Velocity) / velSq, 0f, 4.0f);
+                    if (tCpa > 0f)
+                    {
+                        Vector3 cpaRel = relPos + (th.Velocity * tCpa);
+                        if (cpaRel.sqrMagnitude <= coverSq &&
+                            !Physics.Linecast(muzzleOrigin, th.WorldPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore) &&
+                            !Physics.Linecast(muzzleOrigin, cand.WorldPos + cpaRel, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+                        {
+                            withinCover = true;
+                        }
+                    }
                 }
 
-                if (velSq > 1f)
+                if (withinCover)
                 {
-                    float tCpa = Mathf.Clamp(-Vector3.Dot(relPos, th.Velocity) / velSq, 0f, 25f);
-                    Vector3 cpa = relPos + (th.Velocity * tCpa);
-                    if (cpa.sqrMagnitude <= coverSq)
-                    {
-                        return true;
-                    }
+                    return true;
                 }
             }
 
@@ -2381,7 +2526,12 @@ namespace MDSFramework.Wta
                 }
 
                 ModularSiteBehavior? candSite = effectorSiteBuffer[i];
-                if (candSite == null || !candSite.IsAlive || candSite.IsHoldFireActive)
+                if (!cand.IsDeployed ||
+                    candSite == null ||
+                    !candSite.IsAlive ||
+                    candSite.IsHoldFireActive ||
+                    candSite.IsVehicleMoving ||
+                    candSite.SuspendedInTransit)
                 {
                     continue;
                 }
@@ -2472,14 +2622,16 @@ namespace MDSFramework.Wta
             return site.Unit != null ? site.Unit.transform.position + (Vector3.up * 2.5f) : Vector3.zero;
         }
 
-        private static void ExecuteHelLaserOrder(
+        private void ExecuteHelLaserOrder(
             ModularSiteBehavior site,
             Unit target,
             ref ThreatSnapshot th,
             SmartEngagementProfile profile,
             float actualDt)
         {
-            if (site.CooldownRemaining > 0f || GameInteropHelpers.IsAircraftSplashed(target))
+            if (site.CooldownRemaining > 0f ||
+                (site.PrimaryMagazineSize > 0 && site.PrimaryAmmoRemaining <= 0) ||
+                GameInteropHelpers.IsAircraftSplashed(target))
             {
                 site.TurretAim?.HideBeam();
                 site.ActiveHelTargetId = PersistentID.None;
@@ -2505,12 +2657,18 @@ namespace MDSFramework.Wta
 
             site.TurretAim?.ShowBeamOrTracer(th.WorldPos, actualDt + 0.12f, 0.085f);
             MdsNetworkSync.BroadcastHelBeam(site, th.WorldPos, actualDt + 0.12f, 0.085f);
+            helBeamedSiteInstancesThisTick.Add(site.GetInstanceID());
+
+            if (site.PrimaryMagazineSize > 0)
+            {
+                site.PrimaryAmmoRemaining = Math.Max(0, site.PrimaryAmmoRemaining - 1);
+                site.SyncWeaponStationsAmmo();
+            }
 
             if (!target.persistentID.Equals(site.ActiveHelTargetId))
             {
                 site.ActiveHelTargetId = target.persistentID;
                 site.ActiveHelDwellSeconds = 0f;
-                return;
             }
 
             site.ActiveHelDwellSeconds += actualDt;
@@ -2522,26 +2680,56 @@ namespace MDSFramework.Wta
 
             if (site.ActiveHelDwellSeconds < requiredDwell)
             {
+                if (site.PrimaryMagazineSize > 0 && site.PrimaryAmmoRemaining <= 0)
+                {
+                    site.TurretAim?.HideBeam();
+                    site.ActiveHelDwellSeconds = 0f;
+                    site.ActiveHelTargetId = PersistentID.None;
+                    site.CooldownRemaining = Mathf.Max(site.CooldownRemaining, 2.5f);
+                }
+
                 return;
             }
 
             site.ActiveHelDwellSeconds = 0f;
             site.ActiveHelTargetId = PersistentID.None;
             site.CooldownRemaining = Mathf.Max(0.25f, site.Spec.FireCooldownSeconds);
+            if (site.PrimaryMagazineSize > 0)
+            {
+                site.PrimaryAmmoRemaining = Math.Max(0, site.PrimaryAmmoRemaining - 4);
+                site.SyncWeaponStationsAmmo();
+                if (site.PrimaryAmmoRemaining <= 0)
+                {
+                    site.CooldownRemaining = Mathf.Max(site.CooldownRemaining, 2.5f);
+                }
+            }
 
             if (target is Missile targetMissile)
             {
-                if (th.IsNuclear && th.AltitudeMeters >= 800f && MdsConfig.EnableHighAltitudeDisarm.Value)
+                if (targetMissile.IsArmed() && (MdsConfig.EnableHighAltitudeDisarm.Value || !th.IsNuclear))
                 {
                     GameInteropHelpers.SafeDisarmWarhead(targetMissile);
                 }
 
-                targetMissile.Detonate(Vector3.up, hitArmor: true, hitTerrain: false);
+                float lethalThermal = Mathf.Max(2500f, GameInteropHelpers.SafeGetHitpoints(targetMissile) * 10f + 500f);
+                ApplyThermalOrKineticDamage(site.Unit, targetMissile, lethalThermal, isFire: true);
+
+                if (!targetMissile.disabled)
+                {
+                    if (site.Unit != null && site.Unit.persistentID.IsValid)
+                    {
+                        targetMissile.RecordDamage(site.Unit.persistentID, 1000f);
+                        targetMissile.ReportKilled();
+                    }
+
+                    targetMissile.Detonate(Vector3.up, hitArmor: true, hitTerrain: false);
+                }
+
                 MdsLog.Debug($"[HEL] '{site.SiteId}' destroyed missile '{target.unitName}' after {requiredDwell:0.00}s dwell.");
             }
             else
             {
-                ApplyThermalOrKineticDamage(site.Unit!, target, 140f, isFire: true);
+                ApplyThermalOrKineticDamage(site.Unit, target, 140f, isFire: true);
             }
         }
 
@@ -2595,7 +2783,8 @@ namespace MDSFramework.Wta
                 th.WorldPos,
                 th.Velocity,
                 th.IsNuclear,
-                th.AltitudeMeters);
+                th.AltitudeMeters,
+                burstRounds);
         }
 
         private static void ExecuteMissileOrder(
@@ -2628,6 +2817,12 @@ namespace MDSFramework.Wta
                 {
                     return;
                 }
+            }
+
+            if ((site.EmconState == FcuEmconState.EoIrEmergencyOnly || site.Spec.LaunchAlongSocketForward) &&
+                Physics.Linecast(GetMuzzleOrigin(site), GetTargetAimPosition(target), (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+            {
+                return;
             }
 
             MissileDefinition? baseDef = GameInteropHelpers.ResolveEncyclopediaMissileDef(
@@ -2684,9 +2879,16 @@ namespace MDSFramework.Wta
                     MdsLog.Info($"[HOJ BLIND LAUNCH] '{site.SiteId}' launched '{missileSpec.DisplayName}' -> '{target.unitName}'.");
                 }
             }
-            else if (reservedAbm && RtsBridgeHost.Current.AbmStockpile is VanillaBridgeFallbacks.VanillaAbmStockpileBridge vb)
+            else if (reservedAbm)
             {
-                vb.RefundAbmInterceptor(site.Faction);
+                if (RtsBridgeHost.RefundAbmInterceptor != null)
+                {
+                    RtsBridgeHost.RefundAbmInterceptor.Invoke(site.Faction, missileSpec.MissileId);
+                }
+                else if (RtsBridgeHost.Current.AbmStockpile is VanillaBridgeFallbacks.VanillaAbmStockpileBridge vb)
+                {
+                    vb.RefundAbmInterceptor(site.Faction);
+                }
             }
         }
 
@@ -2703,7 +2905,52 @@ namespace MDSFramework.Wta
             }
         }
 
-        internal static void ApplyThermalOrKineticDamage(Unit attacker, Unit target, float amount, bool isFire)
+        private void RechargeIdleHelCapacitors(int effectorCount, float actualDt)
+        {
+            if (actualDt <= 0f)
+            {
+                return;
+            }
+
+            const float rechargePerSecond = 6.0f;
+            for (int i = 0; i < effectorCount; i++)
+            {
+                if (effectorBuffer[i].Role != WeaponCascadeRole.LaserHel)
+                {
+                    continue;
+                }
+
+                ModularSiteBehavior? site = effectorSiteBuffer[i];
+                if (site == null ||
+                    !site.IsAlive ||
+                    site.SuspendedInTransit ||
+                    site.PrimaryMagazineSize <= 0 ||
+                    site.PrimaryAmmoRemaining >= site.PrimaryMagazineSize)
+                {
+                    continue;
+                }
+
+                int instanceId = site.GetInstanceID();
+                if (helBeamedSiteInstancesThisTick.Contains(instanceId))
+                {
+                    continue;
+                }
+
+                helCapacitorRechargeAccumBySiteInstance.TryGetValue(instanceId, out float accum);
+                accum += actualDt * rechargePerSecond;
+                if (accum >= 1f)
+                {
+                    int gain = Mathf.FloorToInt(accum);
+                    accum -= gain;
+                    site.PrimaryAmmoRemaining = Math.Min(site.PrimaryMagazineSize, site.PrimaryAmmoRemaining + gain);
+                    site.SyncWeaponStationsAmmo();
+                }
+
+                helCapacitorRechargeAccumBySiteInstance[instanceId] = accum;
+            }
+        }
+
+        internal static void ApplyThermalOrKineticDamage(Unit? attacker, Unit target, float amount, bool isFire)
         {
             PersistentID dealerId = attacker != null ? attacker.persistentID : PersistentID.None;
             if (target is Missile m)
@@ -2762,8 +3009,8 @@ namespace MDSFramework.Wta
                 if (chosenPart != null)
                 {
                     bool isGroundVehicle = target is GroundVehicle;
-                    float pierce = isFire ? 0f : (isGroundVehicle ? amount * 1.65f : amount);
-                    float blast = isFire ? 0f : (isGroundVehicle ? amount * 0.45f : amount * 0.35f);
+                    float pierce = isFire ? 0f : (isGroundVehicle ? amount * 0.85f : amount);
+                    float blast = isFire ? 0f : (isGroundVehicle ? amount * 0.25f : amount * 0.35f);
                     chosenPart.TakeDamage(
                         pierce,
                         blast,

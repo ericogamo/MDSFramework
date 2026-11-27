@@ -154,7 +154,8 @@ namespace MDSFramework.Patches
             ContractorPackage pkg,
             ModularUnitSpec spec,
             bool isCargo,
-            string? fallbackFactionName = null)
+            string? fallbackFactionName = null,
+            bool consumedRtsCap = false)
         {
             if (spawned == null)
             {
@@ -188,7 +189,7 @@ namespace MDSFramework.Patches
                 if (container.GetComponent<AirdropContainerBehavior>() == null)
                 {
                     AirdropContainerBehavior behavior = container.gameObject.AddComponent<AirdropContainerBehavior>();
-                    behavior.ConsumedRtsCap = false;
+                    behavior.ConsumedRtsCap = consumedRtsCap;
                     behavior.Initialize(pkg, spec, container, faction, ensureParachute: false);
                 }
             }
@@ -201,7 +202,7 @@ namespace MDSFramework.Patches
                     def,
                     faction,
                     hq,
-                    consumedRtsCap: false,
+                    consumedRtsCap: consumedRtsCap,
                     startDeployed: ModularSiteManager.ShouldStartDeployed(spec));
             }
         }
@@ -299,6 +300,16 @@ namespace MDSFramework.Patches
                     out UnitDefinition def,
                     out bool isCargo))
             {
+                bool effectiveCargo = isCargo || unit is Container;
+                if (effectiveCargo &&
+                    !isCargo &&
+                    AirdropCatalogManager.TryGetEntryByUnitId(spec.UnitId, out AirdropCatalogEntry airdropEntry))
+                {
+                    pkg = airdropEntry.Package;
+                    spec = airdropEntry.Spec;
+                    def = airdropEntry.CargoDefinition;
+                }
+
                 unit.definition = def;
                 ModularSiteManager.RemoveVanillaRearmer(unit, spec);
                 ModularSiteManager.ConfigureRepairabilityAndMapIcon(unit, null);
@@ -306,7 +317,7 @@ namespace MDSFramework.Patches
                     unit,
                     pkg,
                     spec,
-                    startDeployed: !isCargo && ModularSiteManager.ShouldStartDeployed(spec));
+                    startDeployed: !effectiveCargo && ModularSiteManager.ShouldStartDeployed(spec));
                 MdsWeaponStationBuilder.ApplyWeaponStations(unit, pkg, spec, site: null, clientProxy: proxy);
 
                 if (unit.disabled)
@@ -646,17 +657,37 @@ namespace MDSFramework.Patches
     [HarmonyPatch(typeof(VehicleDepot), nameof(VehicleDepot.TrySpawnVehicle), new[] { typeof(VehicleDefinition) })]
     internal static class VehicleDepotTrySpawnVehiclePatch
     {
-        private static void Prefix(VehicleDefinition? vehicleDefinition, out bool __state)
+        private static bool Prefix(VehicleDepot __instance, VehicleDefinition? vehicleDefinition, ref bool __result, out bool __state)
         {
             if (vehicleDefinition != null &&
                 MdsEncyclopediaCatalog.TryResolveUnitDefinition(vehicleDefinition, out ContractorPackage pkg, out ModularUnitSpec spec, out bool isCargo))
             {
+                if (GameInteropHelpers.IsGameplayActive() &&
+                    GameInteropHelpers.IsServerAuthority() &&
+                    spec.Logistics != null)
+                {
+                    FactionHQ? hq = __instance != null ? (__instance.NetworkHQ ?? __instance.MapHQ) : null;
+                    FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(hq);
+                    if (!RtsBridgeHost.Current.Caps.CanConsumeCap(
+                            faction,
+                            spec.Logistics.CapCategory,
+                            spec.Logistics.CapWeight,
+                            out _))
+                    {
+                        MdsLog.Warn($"[VehicleDepot] Unit cap full for '{spec.UnitId}' ({faction}); blocking depot spawn.");
+                        __result = false;
+                        __state = false;
+                        return false;
+                    }
+                }
+
                 PendingMdsSpawnScope.PushUnit(pkg, spec, vehicleDefinition, isCargo, autoAttachSiteOnSpawn: true);
                 __state = true;
-                return;
+                return true;
             }
 
             __state = false;
+            return true;
         }
 
         private static void Finalizer(bool __state)
@@ -692,12 +723,25 @@ namespace MDSFramework.Patches
                 ctx.AutoAttachSiteOnSpawn &&
                 ctx.UnitSpec != null)
             {
+                bool consumedCap = false;
+                if (GameInteropHelpers.IsGameplayActive() &&
+                    GameInteropHelpers.IsServerAuthority() &&
+                    ctx.UnitSpec.Logistics != null)
+                {
+                    FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(__result.NetworkHQ ?? __result.MapHQ);
+                    consumedCap = RtsBridgeHost.Current.Caps.TryConsumeCap(
+                        faction,
+                        ctx.UnitSpec.Logistics.CapCategory,
+                        ctx.UnitSpec.Logistics.CapWeight);
+                }
+
                 MissionEditorPatchHelpers.ActivateMdsUnitOrPreview(
                     __result,
                     ctx.Definition,
                     ctx.Package,
                     ctx.UnitSpec,
-                    ctx.IsCargoContainer);
+                    ctx.IsCargoContainer,
+                    consumedRtsCap: consumedCap);
             }
         }
     }

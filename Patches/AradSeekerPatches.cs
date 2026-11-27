@@ -19,11 +19,7 @@ namespace MDSFramework.Patches
                 return;
             }
 
-            Radar? targeted = __result ?? (GameInteropHelpers.ArmTargetedRadarField?.GetValue(__instance) as Radar);
-            if (targeted != null)
-            {
-                SensorNetworkManager.Instance?.NotifyAradThreat(targeted, missile);
-            }
+            SensorNetworkManager.Instance?.NotifyAradThreat(__result, missile);
         }
     }
 }

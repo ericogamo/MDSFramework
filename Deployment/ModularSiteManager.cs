@@ -15,6 +15,8 @@ namespace MDSFramework.Deployment
         private IRtsLogisticsBridge? subscribedLogistics;
         private int nextSiteSerial = 1;
 
+        internal bool LastPhysicalKitSpawnSucceeded { get; private set; }
+
         internal ModularSiteManager()
         {
             Instance = this;
@@ -35,6 +37,7 @@ namespace MDSFramework.Deployment
         internal void ResetSession()
         {
             nextSiteSerial = 1;
+            LastPhysicalKitSpawnSucceeded = false;
         }
 
         internal ModularSiteBehavior? SpawnPhysicalSite(string unitId, FactionAffinity faction, Vector3 worldPos, float yawDeg)
@@ -283,7 +286,7 @@ namespace MDSFramework.Deployment
             ModularSiteBehavior behavior = unit.gameObject.AddComponent<ModularSiteBehavior>();
             behavior.ConsumedRtsCap = consumedRtsCap;
             behavior.Initialize(siteId, package, spec, resolvedFaction, hq, unit, rig, animator, turretAim);
-            MdsDestructionManager.SuppressVanillaWreckage(unit);
+            MdsDestructionManager.SuppressVanillaWreckage(unit, package, spec);
             ConfigureRepairabilityAndMapIcon(unit, behavior);
             MdsWeaponStationBuilder.ApplyWeaponStations(unit, package, spec, behavior);
             behavior.SyncWeaponStationsAmmo();
@@ -371,7 +374,7 @@ namespace MDSFramework.Deployment
 
             if (GameManager.gameState != GameState.Editor && GameManager.gameState != GameState.Encyclopedia)
             {
-                MdsDestructionManager.SuppressVanillaWreckage(unit);
+                MdsDestructionManager.SuppressVanillaWreckage(unit, package, spec);
                 MdsClientDestructionWatcher watcher = unit.GetComponent<MdsClientDestructionWatcher>()
                     ?? unit.gameObject.AddComponent<MdsClientDestructionWatcher>();
                 watcher.Configure(unit, package, spec);
@@ -435,7 +438,7 @@ namespace MDSFramework.Deployment
                 GameManager.gameState != GameState.Encyclopedia &&
                 targetRoot.TryGetComponent(out Unit previewUnit))
             {
-                MdsDestructionManager.SuppressVanillaWreckage(previewUnit);
+                MdsDestructionManager.SuppressVanillaWreckage(previewUnit, package, spec);
                 if (previewUnit.GetComponent<ModularSiteBehavior>() == null)
                 {
                     MdsClientDestructionWatcher watcher = previewUnit.GetComponent<MdsClientDestructionWatcher>()
@@ -499,7 +502,7 @@ namespace MDSFramework.Deployment
             }
 
             string siteId = $"{airdrop.Spec.UnitId}_{nextSiteSerial++}";
-            FactionHQ? hq = airdrop.Container.NetworkHQ ?? airdrop.Container.MapHQ ?? GameInteropHelpers.TryResolveFactionHQ(airdrop.Faction);
+            FactionHQ? hq = airdrop.Hq ?? airdrop.Container.NetworkHQ ?? airdrop.Container.MapHQ ?? GameInteropHelpers.TryResolveFactionHQ(airdrop.Faction);
             FactionAffinity resolvedFaction = airdrop.Faction != FactionAffinity.Any
                 ? airdrop.Faction
                 : GameInteropHelpers.ToFactionAffinity(hq);
@@ -805,7 +808,12 @@ namespace MDSFramework.Deployment
 
         private void HandlePhysicalKitDelivered(string unitId, FactionAffinity faction, Vector3 worldPos, float yawDeg)
         {
-            SpawnPhysicalSite(unitId, faction, worldPos, yawDeg);
+            ModularSiteBehavior? site = SpawnPhysicalSite(unitId, faction, worldPos, yawDeg);
+            LastPhysicalKitSpawnSucceeded = site != null;
+            if (site == null)
+            {
+                MdsLog.Warn($"[Deploy] Physical kit delivery failed to spawn '{unitId}' ({faction}) at {worldPos}.");
+            }
         }
     }
 

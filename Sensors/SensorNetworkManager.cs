@@ -8,6 +8,7 @@ namespace MDSFramework.Sensors
     internal struct HojTrackEntry
     {
         internal FactionAffinity Faction;
+        internal FactionHQ? Hq;
         internal Unit? JammerUnit;
         internal PersistentID JammerId;
         internal Vector3 TriangulatedWorldPos;
@@ -24,11 +25,16 @@ namespace MDSFramework.Sensors
         private const float BlinkOverlapSeconds = 0.75f;
         private const float HojTrackExpirySeconds = 18.0f;
         private const float PassiveEcmPollIntervalSeconds = 0.5f;
+        private const float PassiveEcmLatchSeconds = 2.5f;
+        private const float HojSilentCutoffDirectSeconds = 7.5f;
+        private const float HojSilentCutoffUpdateSeconds = 8.0f;
 
         internal static SensorNetworkManager? Instance { get; private set; }
 
         private readonly List<ModularSiteBehavior> allSites = new List<ModularSiteBehavior>(32);
         private readonly List<HojTrackEntry> activeHojTracks = new List<HojTrackEntry>(16);
+        private readonly Dictionary<Unit, float> lastPassiveEcmPulseTime = new Dictionary<Unit, float>();
+        private readonly List<Unit> stalePulseScratch = new List<Unit>(16);
         private readonly List<ModularSiteBehavior> scratchFcus = new List<ModularSiteBehavior>(16);
         private readonly List<ModularSiteBehavior> scratchEffectors = new List<ModularSiteBehavior>(32);
         private readonly List<ModularSiteBehavior> eligibleBlinkFcus = new List<ModularSiteBehavior>(16);
@@ -75,13 +81,21 @@ namespace MDSFramework.Sensors
             allSites.Remove(site);
             try
             {
-                RtsBridgeHost.Current.AiThreats.ReportSiteDestroyed(site.SiteId);
-                if (site.ConsumedRtsCap && site.Spec?.Logistics != null)
+                if (site.ConsumedRtsCap)
                 {
-                    RtsBridgeHost.Current.Caps.ReleaseCap(
-                        site.Faction,
-                        site.Spec.Logistics.CapCategory,
-                        site.Spec.Logistics.CapWeight);
+                    RtsBridgeHost.Current.AiThreats.ReportSiteDestroyed(site.SiteId);
+                    if (site.Spec?.Logistics != null && GameInteropHelpers.IsServerAuthority())
+                    {
+                        FactionAffinity releaseFaction = site.Faction != FactionAffinity.Any
+                            ? site.Faction
+                            : GameInteropHelpers.ToFactionAffinity(site.Hq);
+                        RtsBridgeHost.Current.Caps.ReleaseCap(
+                            releaseFaction,
+                            site.Spec.Logistics.CapCategory,
+                            site.Spec.Logistics.CapWeight);
+                    }
+
+                    site.ConsumedRtsCap = false;
                 }
             }
             catch (Exception ex)
@@ -99,6 +113,8 @@ namespace MDSFramework.Sensors
         {
             allSites.Clear();
             activeHojTracks.Clear();
+            lastPassiveEcmPulseTime.Clear();
+            stalePulseScratch.Clear();
             scratchFcus.Clear();
             scratchEffectors.Clear();
             eligibleBlinkFcus.Clear();
@@ -182,7 +198,7 @@ namespace MDSFramework.Sensors
             return false;
         }
 
-        internal bool HasFreshDirectJamEvent(Unit? unit, float maxAgeSeconds = 0.65f)
+        internal bool HasFreshDirectJamEvent(Unit? unit, float maxAgeSeconds = 3.5f)
         {
             if (unit == null || unit.disabled)
             {
@@ -204,7 +220,17 @@ namespace MDSFramework.Sensors
             return false;
         }
 
-        internal bool IsUnitActivelyEmittingEcm(Unit? unit, float maxJamPodAgeSeconds = 0.65f)
+        internal void RecordPassiveEcmPulse(Unit? unit)
+        {
+            if (unit == null || unit.disabled || GameInteropHelpers.IsAircraftSplashed(unit))
+            {
+                return;
+            }
+
+            lastPassiveEcmPulseTime[unit] = Time.time;
+        }
+
+        internal bool IsUnitActivelyEmittingEcm(Unit? unit, float maxJamPodAgeSeconds = 3.5f)
         {
             if (unit == null || unit.disabled || GameInteropHelpers.IsAircraftSplashed(unit))
             {
@@ -212,6 +238,12 @@ namespace MDSFramework.Sensors
             }
 
             if (unit is Aircraft ac && ac.GetECMIntensity() > 0.05f)
+            {
+                return true;
+            }
+
+            if (lastPassiveEcmPulseTime.TryGetValue(unit, out float pulseTime) &&
+                (Time.time - pulseTime) <= PassiveEcmLatchSeconds)
             {
                 return true;
             }
@@ -232,7 +264,11 @@ namespace MDSFramework.Sensors
                 ModularSiteBehavior site = allSites[i];
                 if (site.IsAlive && ReferenceEquals(site.Unit, victim))
                 {
-                    site.NotifyJammed(jammer, jamAmount);
+                    if (site.IsRadarEmitting)
+                    {
+                        site.NotifyJammed(jammer, jamAmount);
+                    }
+
                     victimSite = site;
                 }
             }
@@ -242,26 +278,45 @@ namespace MDSFramework.Sensors
                 return;
             }
 
-            FactionAffinity victimFaction = GameInteropHelpers.ToFactionAffinity(victim.NetworkHQ ?? victim.MapHQ);
-            if (victimFaction == FactionAffinity.Any ||
-                !GameInteropHelpers.IsHostileToAffinity(jammer, victimFaction, victim.NetworkHQ ?? victim.MapHQ))
+            FactionHQ? victimHq = victim.NetworkHQ ?? victim.MapHQ;
+            if (victimHq == null)
             {
                 return;
             }
 
-            bool victimIsRadarOrFcu =
-                victim.radar != null ||
-                (victimSite != null &&
-                 (victimSite.Spec.Role == WeaponCascadeRole.FireControl ||
-                  victimSite.Spec.Role == WeaponCascadeRole.EarlyWarningRadar ||
-                  (victimSite.Spec.SensorProfile != null && victimSite.Spec.SensorProfile.IsFireControlUnit)));
+            FactionAffinity victimFaction = GameInteropHelpers.ToFactionAffinity(victimHq);
+            if (!GameInteropHelpers.IsHostileToAffinity(jammer, victimFaction, victimHq))
+            {
+                return;
+            }
+
+            bool victimIsMdsFcuOrEwr =
+                victimSite != null &&
+                (victimSite.Spec.Role == WeaponCascadeRole.FireControl ||
+                 victimSite.Spec.Role == WeaponCascadeRole.EarlyWarningRadar ||
+                 (victimSite.Spec.SensorProfile != null && victimSite.Spec.SensorProfile.IsFireControlUnit));
+
+            bool victimIsVanillaSurfaceRadar =
+                victimSite == null &&
+                victim is not Aircraft &&
+                victim.radar != null &&
+                victim.radar.activated;
+
+            bool victimIsRadarOrFcu = victimIsMdsFcuOrEwr || victimIsVanillaSurfaceRadar;
 
             Vector3 jammerPos = jammer.transform.position;
             int observers = 0;
             for (int i = 0; i < allSites.Count; i++)
             {
                 ModularSiteBehavior site = allSites[i];
-                if (!site.IsAlive || site.Faction != victimFaction || site.Spec.SensorProfile == null)
+                if (!SensorBandPhysics.CanSiteSense(site) || site.Unit == null || site.Spec.SensorProfile == null)
+                {
+                    continue;
+                }
+
+                bool sameHq = site.Hq != null && ReferenceEquals(site.Hq, victimHq);
+                bool sameFaction = victimFaction != FactionAffinity.Any && site.Faction == victimFaction;
+                if (!sameHq && !sameFaction)
                 {
                     continue;
                 }
@@ -273,13 +328,15 @@ namespace MDSFramework.Sensors
                 }
 
                 float maxRangeM = Mathf.Max(80000f, site.Spec.SensorProfile.DetectionRangeKm * 1500f);
-                if (site.Unit != null && (site.Unit.transform.position - jammerPos).sqrMagnitude <= maxRangeM * maxRangeM)
+                Vector3 siteEye = site.Unit.transform.position + (Vector3.up * 3f);
+                if ((site.Unit.transform.position - jammerPos).sqrMagnitude <= maxRangeM * maxRangeM &&
+                    !Physics.Linecast(siteEye, jammerPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                 {
                     observers++;
                 }
             }
 
-            if (victimSite != null || victimIsRadarOrFcu)
+            if (victimSite != null && victimSite.IsRadarEmitting)
             {
                 observers = Math.Max(observers, 1);
             }
@@ -295,11 +352,12 @@ namespace MDSFramework.Sensors
                 : jammerPos + new Vector3(Mathf.Sin(Time.time * 1.7f) * 85f, 0f, Mathf.Cos(Time.time * 1.3f) * 85f);
 
             Vector3 vel = jammer.rb != null ? jammer.rb.velocity : Vector3.zero;
-            UpsertHojTrack(victimFaction, jammer, estimatedPos, vel, observers, victimIsRadarOrFcu, isDirectJamEvent: true);
+            UpsertHojTrack(victimFaction, victimHq, jammer, estimatedPos, vel, observers, victimIsRadarOrFcu, isDirectJamEvent: true);
         }
 
         private void UpsertHojTrack(
             FactionAffinity faction,
+            FactionHQ? hq,
             Unit jammer,
             Vector3 estimatedPos,
             Vector3 vel,
@@ -311,13 +369,24 @@ namespace MDSFramework.Sensors
             for (int i = 0; i < activeHojTracks.Count; i++)
             {
                 HojTrackEntry entry = activeHojTracks[i];
-                if (entry.Faction == faction && ReferenceEquals(entry.JammerUnit, jammer))
+                bool factionMatch = (hq != null && entry.Hq != null)
+                    ? ReferenceEquals(entry.Hq, hq)
+                    : entry.Faction == faction;
+                if (factionMatch && ReferenceEquals(entry.JammerUnit, jammer))
                 {
+                    bool wasDirectJamActive = entry.LastDirectJamEventTime > 0f &&
+                                              (now - entry.LastDirectJamEventTime) <= 3.5f;
                     bool wakeNow = (!entry.VictimIsRadarOrFcu && victimIsRadarOrFcu) ||
+                                   (isDirectJamEvent && !wasDirectJamActive) ||
                                    (now - entry.LastUpdatedTime > 1.0f);
                     entry.TriangulatedWorldPos = estimatedPos;
                     entry.Velocity = vel;
                     entry.LastUpdatedTime = now;
+                    if (hq != null && entry.Hq == null)
+                    {
+                        entry.Hq = hq;
+                    }
+
                     if (isDirectJamEvent)
                     {
                         entry.LastDirectJamEventTime = now;
@@ -344,6 +413,7 @@ namespace MDSFramework.Sensors
             activeHojTracks.Add(new HojTrackEntry
             {
                 Faction = faction,
+                Hq = hq,
                 JammerUnit = jammer,
                 JammerId = jammer.persistentID,
                 TriangulatedWorldPos = estimatedPos,
@@ -365,32 +435,51 @@ namespace MDSFramework.Sensors
         private void PollActiveEcmEmissions()
         {
             if (!MdsConfig.EnableHojTriangulation.Value ||
-                allSites.Count == 0 ||
                 !GameInteropHelpers.IsServerAuthority() ||
                 UnitRegistry.allUnits == null)
             {
                 return;
             }
 
+            float now = Time.time;
+            var allHqs = FactionRegistry.GetAllHQs();
             List<Unit> allUnits = UnitRegistry.allUnits;
             for (int u = 0; u < allUnits.Count; u++)
             {
                 if (allUnits[u] is not Aircraft ac ||
                     ac.disabled ||
-                    GameInteropHelpers.IsAircraftSplashed(ac) ||
-                    ac.GetECMIntensity() <= 0.15f)
+                    GameInteropHelpers.IsAircraftSplashed(ac))
                 {
                     continue;
                 }
 
-                PollFactionEcmForAircraft(ac, FactionAffinity.Boscali);
-                PollFactionEcmForAircraft(ac, FactionAffinity.Primeva);
+                bool hasPassivePulse = lastPassiveEcmPulseTime.TryGetValue(ac, out float pulseTime) &&
+                                       (now - pulseTime) <= PassiveEcmLatchSeconds;
+                if (ac.GetECMIntensity() <= 0.15f && !hasPassivePulse)
+                {
+                    continue;
+                }
+
+                if (allHqs.Count > 0)
+                {
+                    foreach (FactionHQ hq in allHqs)
+                    {
+                        if (hq != null)
+                        {
+                            PollFactionEcmForAircraft(ac, GameInteropHelpers.ToFactionAffinity(hq), hq);
+                        }
+                    }
+                }
+                else
+                {
+                    PollFactionEcmForAircraft(ac, FactionAffinity.Boscali, GameInteropHelpers.TryResolveFactionHQ(FactionAffinity.Boscali));
+                    PollFactionEcmForAircraft(ac, FactionAffinity.Primeva, GameInteropHelpers.TryResolveFactionHQ(FactionAffinity.Primeva));
+                }
             }
         }
 
-        private void PollFactionEcmForAircraft(Aircraft ac, FactionAffinity faction)
+        private void PollFactionEcmForAircraft(Aircraft ac, FactionAffinity faction, FactionHQ? hq)
         {
-            FactionHQ? hq = GameInteropHelpers.TryResolveFactionHQ(faction);
             if (!GameInteropHelpers.IsHostileToAffinity(ac, faction, hq))
             {
                 return;
@@ -401,7 +490,15 @@ namespace MDSFramework.Sensors
             for (int i = 0; i < allSites.Count; i++)
             {
                 ModularSiteBehavior site = allSites[i];
-                if (!site.IsAlive || site.Faction != faction || site.Unit == null || site.Spec.SensorProfile == null)
+                if (!SensorBandPhysics.CanSiteSense(site) || site.Unit == null || site.Spec.SensorProfile == null)
+                {
+                    continue;
+                }
+
+                bool owned = hq != null && site.Hq != null
+                    ? ReferenceEquals(site.Hq, hq)
+                    : (faction != FactionAffinity.Any && site.Faction == faction);
+                if (!owned)
                 {
                     continue;
                 }
@@ -421,6 +518,36 @@ namespace MDSFramework.Sensors
                 }
             }
 
+            if (observers == 0 && UnitRegistry.allUnits != null)
+            {
+                List<Unit> allUnits = UnitRegistry.allUnits;
+                for (int i = 0; i < allUnits.Count; i++)
+                {
+                    Unit? u = allUnits[i];
+                    if (u == null || u.disabled || u.radar == null || !u.radar.activated)
+                    {
+                        continue;
+                    }
+
+                    FactionHQ? uHq = u.NetworkHQ ?? u.MapHQ;
+                    bool owned = hq != null && uHq != null
+                        ? ReferenceEquals(uHq, hq)
+                        : (faction != FactionAffinity.Any && GameInteropHelpers.ToFactionAffinity(uHq) == faction);
+                    if (!owned)
+                    {
+                        continue;
+                    }
+
+                    float radarRangeM = Mathf.Max(45000f, u.radar.GetRadarRange());
+                    Vector3 eye = u.transform.position + (Vector3.up * 3f);
+                    if ((u.transform.position - acPos).sqrMagnitude <= radarRangeM * radarRangeM &&
+                        !Physics.Linecast(eye, acPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+                    {
+                        observers++;
+                    }
+                }
+            }
+
             if (observers <= 0)
             {
                 return;
@@ -430,7 +557,7 @@ namespace MDSFramework.Sensors
                 ? acPos
                 : acPos + new Vector3(Mathf.Sin(Time.time * 1.7f) * 85f, 0f, Mathf.Cos(Time.time * 1.3f) * 85f);
             Vector3 vel = ac.rb != null ? ac.rb.velocity : Vector3.zero;
-            UpsertHojTrack(faction, ac, estimatedPos, vel, observers, victimIsRadarOrFcu: false, isDirectJamEvent: false);
+            UpsertHojTrack(faction, hq, ac, estimatedPos, vel, observers, victimIsRadarOrFcu: false, isDirectJamEvent: false);
         }
 
         internal void NotifyAradThreat(Radar? targetedRadar, Missile aradMissile)
@@ -464,7 +591,7 @@ namespace MDSFramework.Sensors
                     continue;
                 }
 
-                bool directTarget = radarUnit != null && ReferenceEquals(site.Unit, radarUnit);
+                bool directTarget = radarUnit != null && site.IsRadarEmitting && ReferenceEquals(site.Unit, radarUnit);
                 Vector3 toSite = site.Unit.transform.position - aradPos;
                 float distSq = toSite.sqrMagnitude;
                 bool closeIncoming = !directTarget &&
@@ -503,7 +630,10 @@ namespace MDSFramework.Sensors
             for (int i = 0; i < allSites.Count; i++)
             {
                 ModularSiteBehavior candidate = allSites[i];
-                if (!candidate.IsAlive || ReferenceEquals(candidate, downedFcu) || candidate.Faction != downedFcu.Faction)
+                if (!candidate.IsAlive ||
+                    candidate.SuspendedInTransit ||
+                    ReferenceEquals(candidate, downedFcu) ||
+                    candidate.Faction != downedFcu.Faction)
                 {
                     continue;
                 }
@@ -881,6 +1011,7 @@ namespace MDSFramework.Sensors
                     if (MdsConfig.EnableTwoFcuBlinking.Value &&
                         MdsConfig.EnableEccmNetwork.Value &&
                         fcu.Spec.SensorProfile.EnableTwoFcuBlinking &&
+                        !fcu.SuspendedInTransit &&
                         fcu.IsDeployed)
                     {
                         eligibleBlinkFcus.Add(fcu);
@@ -964,9 +1095,7 @@ namespace MDSFramework.Sensors
                         float cycleSlotSec = clusterFcus.Count == 2
                             ? Mathf.Max(3f, (onSec + offSec) * 0.5f)
                             : onSec;
-                        float litDuration = clusterFcus.Count == 2
-                            ? Mathf.Max(cycleSlotSec, onSec)
-                            : cycleSlotSec;
+                        float litDuration = cycleSlotSec;
                         float totalCycle = cycleSlotSec * clusterFcus.Count;
                         float phase = blinkClock % totalCycle;
 
@@ -974,9 +1103,8 @@ namespace MDSFramework.Sensors
                         {
                             float slotStart = idx * cycleSlotSec;
                             float slotEnd = slotStart + litDuration + BlinkOverlapSeconds;
-                            bool isLit = (phase >= slotStart && phase <= slotEnd) ||
-                                         (slotEnd > totalCycle && phase <= (slotEnd - totalCycle)) ||
-                                         (idx == 0 && phase >= totalCycle - BlinkOverlapSeconds);
+                            bool isLit = (phase >= slotStart && phase < slotEnd) ||
+                                         (slotEnd > totalCycle && phase < (slotEnd - totalCycle));
 
                             clusterFcus[idx].EmconState = isLit ? FcuEmconState.BlinkingActive : FcuEmconState.BlinkingSilent;
                         }
@@ -1013,10 +1141,14 @@ namespace MDSFramework.Sensors
             for (int i = activeHojTracks.Count - 1; i >= 0; i--)
             {
                 HojTrackEntry entry = activeHojTracks[i];
+                bool hasRecentPassivePulse = entry.JammerUnit != null &&
+                                             lastPassiveEcmPulseTime.TryGetValue(entry.JammerUnit, out float pulseTime) &&
+                                             (now - pulseTime) <= HojSilentCutoffDirectSeconds;
                 bool silentAircraft = entry.JammerUnit is Aircraft ac &&
                                       ac.GetECMIntensity() <= 0.05f &&
-                                      (entry.LastDirectJamEventTime <= 0f || now - entry.LastDirectJamEventTime > 1.2f) &&
-                                      (now - entry.LastUpdatedTime) > 1.5f;
+                                      !hasRecentPassivePulse &&
+                                      (entry.LastDirectJamEventTime <= 0f || now - entry.LastDirectJamEventTime > HojSilentCutoffDirectSeconds) &&
+                                      (now - entry.LastUpdatedTime) > HojSilentCutoffUpdateSeconds;
 
                 if (entry.JammerUnit == null ||
                     entry.JammerUnit.disabled ||
@@ -1025,6 +1157,23 @@ namespace MDSFramework.Sensors
                     now - entry.LastUpdatedTime > HojTrackExpirySeconds)
                 {
                     activeHojTracks.RemoveAt(i);
+                }
+            }
+
+            if (lastPassiveEcmPulseTime.Count > 0)
+            {
+                stalePulseScratch.Clear();
+                foreach (KeyValuePair<Unit, float> kv in lastPassiveEcmPulseTime)
+                {
+                    if (!ReferenceEquals(kv.Key, null) && (kv.Key == null || kv.Key.disabled || (now - kv.Value) > HojTrackExpirySeconds))
+                    {
+                        stalePulseScratch.Add(kv.Key!);
+                    }
+                }
+
+                for (int i = 0; i < stalePulseScratch.Count; i++)
+                {
+                    lastPassiveEcmPulseTime.Remove(stalePulseScratch[i]);
                 }
             }
         }

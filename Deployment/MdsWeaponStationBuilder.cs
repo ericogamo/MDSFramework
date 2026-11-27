@@ -249,7 +249,7 @@ namespace MDSFramework.Deployment
             if (spec.Role == WeaponCascadeRole.LaserHel)
             {
                 WeaponInfo info = GetOrCreateHelWeaponInfo(package, spec);
-                AddStation(unit, info, site, clientProxy, secondarySlot: false, capacity: 100, rearmable: false);
+                AddStation(unit, info, site, clientProxy, secondarySlot: false, capacity: Math.Max(1, primaryCap), rearmable: false);
                 return;
             }
 
@@ -379,6 +379,7 @@ namespace MDSFramework.Deployment
             info.fireInterval = Mathf.Max(0.15f, spec.FireCooldownSeconds);
             info.pierceDamage = 28f;
             info.blastDamage = Mathf.Max(15f, spec.GunDamagePerBurst);
+            info.pK = 0.25f;
             info.costPerRound = Mathf.Max(0.01f, spec.GunRearmCostPerRound);
             info.massPerRound = 0.75f;
             info.weaponIcon = TryLoadWeaponIconSprite(pkg, spec.WeaponIconRelativePath);
@@ -425,6 +426,7 @@ namespace MDSFramework.Deployment
             info.fireInterval = Mathf.Max(0.2f, spec.FireCooldownSeconds);
             info.pierceDamage = 0f;
             info.blastDamage = 140f * Mathf.Max(0.5f, spec.LaserPowerFactor);
+            info.pK = 0.85f;
             info.costPerRound = 0f;
             info.massPerRound = 0f;
             info.weaponIcon = TryLoadWeaponIconSprite(pkg, spec.WeaponIconRelativePath);
@@ -479,18 +481,35 @@ namespace MDSFramework.Deployment
             info.energy = false;
             info.cargo = false;
             info.overHorizon = isAntiShip || isAntiVehicle || effRangeKm >= 25f;
+            float antiShipCruiseSpeed = missileSpec.TargetMach > 0f
+                ? missileSpec.TargetMach * 340.3f
+                : Mathf.Max(280f, missileSpec.CruiseSpeedMps);
+            float antiShipMaxSpeed = missileSpec.MaxSpeedMps > 0f
+                ? Mathf.Max(antiShipCruiseSpeed, missileSpec.MaxSpeedMps)
+                : (missileSpec.MaxMach > 0f
+                    ? Mathf.Max(antiShipCruiseSpeed, missileSpec.MaxMach * 340.3f)
+                    : antiShipCruiseSpeed);
             info.muzzleVelocity = isAntiShip
-                ? 306f
+                ? antiShipCruiseSpeed
                 : isAntiVehicle
                     ? Mathf.Max(90f, missileSpec.CruiseSpeedMps)
                     : Mathf.Max(400f, missileSpec.CruiseSpeedMps);
             info.maxSpeed = isAntiShip
-                ? 306f
+                ? antiShipMaxSpeed
                 : isAntiVehicle
                     ? Mathf.Max(110f, missileSpec.MaxSpeedMps > 0f ? missileSpec.MaxSpeedMps : missileSpec.CruiseSpeedMps)
                     : Mathf.Max(400f, missileSpec.CruiseSpeedMps);
             info.fireInterval = Mathf.Max(0.5f, siteSpec.FireCooldownSeconds);
             info.blastDamage = Mathf.Max(10f, missileSpec.BlastYield);
+            info.pK = isAntiShip
+                ? Mathf.Clamp(info.blastDamage / 25f, 0.75f, 8.0f)
+                : isAntiVehicle
+                    ? Mathf.Clamp(info.blastDamage / 15f, 0.45f, 1.5f)
+                    : missileSpec.IsAbmInterceptor
+                        ? 0.90f
+                        : effRangeKm >= 25f
+                            ? 0.85f
+                            : 0.75f;
             info.costPerRound = Mathf.Max(0.5f, missileSpec.RearmCostPerRound);
             info.massPerRound = isAntiShip
                 ? Mathf.Clamp(missileSpec.AircraftMountMassKg > 0f ? missileSpec.AircraftMountMassKg : 416f, 180f, 950f)

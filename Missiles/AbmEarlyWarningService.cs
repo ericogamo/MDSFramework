@@ -15,6 +15,8 @@ namespace MDSFramework.Missiles
             internal PersistentID ThreatId;
             internal Missile? ThreatMissile;
             internal FactionAffinity TargetFaction;
+            internal FactionHQ? LauncherHq;
+            internal FactionHQ? TargetHq;
             internal Vector3 LastPosition;
             internal float BlastYield;
             internal float DetectedTime;
@@ -25,6 +27,8 @@ namespace MDSFramework.Missiles
         private readonly List<BallisticWarningEntry> activeWarnings = new List<BallisticWarningEntry>(16);
         private readonly HashSet<uint> notifiedThreatIds = new HashSet<uint>();
         private IRtsAbmStockpileBridge? subscribedBridge;
+        private FactionHQ? pendingExternalLauncherHq;
+        private FactionHQ? pendingExternalTargetHq;
 
         internal IReadOnlyList<BallisticWarningEntry> ActiveWarnings => activeWarnings;
         internal int ActiveWarningCount => activeWarnings.Count;
@@ -50,6 +54,8 @@ namespace MDSFramework.Missiles
         {
             activeWarnings.Clear();
             notifiedThreatIds.Clear();
+            pendingExternalLauncherHq = null;
+            pendingExternalTargetHq = null;
         }
 
         internal void ApplyClientSnapshot(string encoded)
@@ -121,7 +127,7 @@ namespace MDSFramework.Missiles
 
         internal void NotifyPotentialBallisticLaunch(Missile missile, bool hasBallisticGuidance)
         {
-            if (!MdsConfig.EnableAbmEarlyWarning.Value || missile == null || missile.disabled)
+            if (!GameInteropHelpers.IsServerAuthority() || !MdsConfig.EnableAbmEarlyWarning.Value || missile == null || missile.disabled)
             {
                 return;
             }
@@ -160,12 +166,9 @@ namespace MDSFramework.Missiles
                 notifiedThreatIds.Add(pid.Id);
             }
 
-            FactionAffinity launcherFaction = GameInteropHelpers.ToFactionAffinity(missile.NetworkHQ ?? missile.MapHQ);
-            FactionAffinity targetFaction = launcherFaction == FactionAffinity.Boscali
-                ? FactionAffinity.Primeva
-                : launcherFaction == FactionAffinity.Primeva
-                    ? FactionAffinity.Boscali
-                    : FactionAffinity.Any;
+            FactionHQ? launcherHq = missile.NetworkHQ ?? missile.MapHQ;
+            FactionHQ? targetHq = ResolveTargetHq(missile, launcherHq);
+            FactionAffinity targetFaction = ResolveTargetFaction(launcherHq, targetHq);
 
             Vector3 pos = missile.transform.position;
             activeWarnings.Add(new BallisticWarningEntry
@@ -173,6 +176,8 @@ namespace MDSFramework.Missiles
                 ThreatId = pid,
                 ThreatMissile = missile,
                 TargetFaction = targetFaction,
+                LauncherHq = launcherHq,
+                TargetHq = targetHq,
                 LastPosition = pos,
                 BlastYield = yield,
                 DetectedTime = Time.time
@@ -180,17 +185,127 @@ namespace MDSFramework.Missiles
 
             MdsLog.Warn(
                 $"[ABM EARLY WARNING] Ballistic/Nuclear launch detected: '{missile.unitName}' " +
-                $"(yield={yield:0}t, ballistic={hasBallisticGuidance}, targetSide={targetFaction}).");
+                $"(yield={yield:0}t, ballistic={hasBallisticGuidance}, targetSide={targetFaction}, targetHq={targetHq?.faction?.factionTag ?? "AnyHostile"}).");
 
             // Pop up ABM VLS containers immediately for the threatened side (via bridge event if vanilla bridge, else direct).
             if (RtsBridgeHost.Current.AbmStockpile is VanillaBridgeFallbacks.VanillaAbmStockpileBridge vanillaBridge)
             {
-                vanillaBridge.RaiseBallisticThreatDetected(targetFaction, pos, yield);
+                pendingExternalLauncherHq = launcherHq;
+                pendingExternalTargetHq = targetHq;
+                try
+                {
+                    vanillaBridge.RaiseBallisticThreatDetected(targetFaction, pos, yield);
+                }
+                finally
+                {
+                    pendingExternalLauncherHq = null;
+                    pendingExternalTargetHq = null;
+                }
             }
             else
             {
-                PopUpAbmSitesForFaction(targetFaction);
+                PopUpAbmSitesForFaction(targetFaction, launcherHq, targetHq);
             }
+        }
+
+        private static FactionHQ? ResolveTargetHq(Missile missile, FactionHQ? launcherHq)
+        {
+            if (missile.targetID.IsValid && missile.targetID.TryGetUnit(out Unit targetUnit) && !targetUnit.disabled)
+            {
+                FactionHQ? uHq = targetUnit.NetworkHQ ?? targetUnit.MapHQ;
+                if (uHq != null && !ReferenceEquals(uHq, launcherHq))
+                {
+                    return uHq;
+                }
+            }
+
+            if (launcherHq == null)
+            {
+                return null;
+            }
+
+            FactionHQ? singleHostileHq = null;
+            int hostileCount = 0;
+            try
+            {
+                foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+                {
+                    if (hq == null || ReferenceEquals(hq, launcherHq))
+                    {
+                        continue;
+                    }
+
+                    singleHostileHq = hq;
+                    hostileCount++;
+                    if (hostileCount > 1)
+                    {
+                        return null;
+                    }
+                }
+            }
+            catch
+            {
+                return null;
+            }
+
+            return hostileCount == 1 ? singleHostileHq : null;
+        }
+
+        private static FactionAffinity ResolveTargetFaction(FactionHQ? launcherHq, FactionHQ? targetHq)
+        {
+            if (targetHq != null)
+            {
+                FactionAffinity targetAffinity = GameInteropHelpers.ToFactionAffinity(targetHq);
+                if (targetAffinity != FactionAffinity.Any)
+                {
+                    return targetAffinity;
+                }
+            }
+
+            FactionAffinity launcherFaction = GameInteropHelpers.ToFactionAffinity(launcherHq);
+            if (launcherFaction == FactionAffinity.Boscali)
+            {
+                return FactionAffinity.Primeva;
+            }
+
+            if (launcherFaction == FactionAffinity.Primeva)
+            {
+                return FactionAffinity.Boscali;
+            }
+
+            if (launcherHq != null)
+            {
+                try
+                {
+                    FactionAffinity uniqueHostileAffinity = FactionAffinity.Any;
+                    int distinctAffinities = 0;
+                    foreach (FactionHQ hq in FactionRegistry.GetAllHQs())
+                    {
+                        if (hq == null || ReferenceEquals(hq, launcherHq))
+                        {
+                            continue;
+                        }
+
+                        FactionAffinity aff = GameInteropHelpers.ToFactionAffinity(hq);
+                        if (aff != FactionAffinity.Any && aff != uniqueHostileAffinity)
+                        {
+                            uniqueHostileAffinity = aff;
+                            distinctAffinities++;
+                        }
+                    }
+
+                    if (distinctAffinities == 1)
+                    {
+                        return uniqueHostileAffinity;
+                    }
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+
+            return FactionAffinity.Any;
         }
 
         internal bool HasActiveWarningForFaction(FactionAffinity faction)
@@ -199,6 +314,35 @@ namespace MDSFramework.Missiles
             {
                 FactionAffinity target = activeWarnings[i].TargetFaction;
                 if (faction == FactionAffinity.Any || target == FactionAffinity.Any || target == faction)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        internal bool HasActiveWarningForHq(FactionHQ? hq, FactionAffinity fallbackFaction)
+        {
+            for (int i = 0; i < activeWarnings.Count; i++)
+            {
+                BallisticWarningEntry entry = activeWarnings[i];
+                if (hq != null && entry.LauncherHq != null && ReferenceEquals(hq, entry.LauncherHq))
+                {
+                    continue;
+                }
+
+                if (hq != null && entry.TargetHq != null)
+                {
+                    if (ReferenceEquals(hq, entry.TargetHq))
+                    {
+                        return true;
+                    }
+
+                    continue;
+                }
+
+                if (fallbackFaction == FactionAffinity.Any || entry.TargetFaction == FactionAffinity.Any || entry.TargetFaction == fallbackFaction)
                 {
                     return true;
                 }
@@ -257,13 +401,18 @@ namespace MDSFramework.Missiles
 
         private void OnExternalBallisticThreat(FactionAffinity targetFaction, Vector3 originPos, float blastYield)
         {
+            if (!GameInteropHelpers.IsServerAuthority())
+            {
+                return;
+            }
+
             MdsLog.Debug($"[ABM] Bridge ballistic threat event: faction={targetFaction}, yield={blastYield:0}t, origin={originPos}.");
-            PopUpAbmSitesForFaction(targetFaction);
+            PopUpAbmSitesForFaction(targetFaction, pendingExternalLauncherHq, pendingExternalTargetHq);
         }
 
-        private static void PopUpAbmSitesForFaction(FactionAffinity targetFaction)
+        private static void PopUpAbmSitesForFaction(FactionAffinity targetFaction, FactionHQ? launcherHq = null, FactionHQ? targetHq = null)
         {
-            if (SensorNetworkManager.Instance == null)
+            if (!GameInteropHelpers.IsServerAuthority() || SensorNetworkManager.Instance == null)
             {
                 return;
             }
@@ -277,7 +426,22 @@ namespace MDSFramework.Missiles
                     continue;
                 }
 
-                if (targetFaction == FactionAffinity.Any || site.Faction == targetFaction || site.Faction == FactionAffinity.Any)
+                if (launcherHq != null && site.Hq != null && ReferenceEquals(site.Hq, launcherHq))
+                {
+                    continue;
+                }
+
+                bool factionMatch;
+                if (targetHq != null && site.Hq != null)
+                {
+                    factionMatch = ReferenceEquals(site.Hq, targetHq);
+                }
+                else
+                {
+                    factionMatch = targetFaction == FactionAffinity.Any || site.Faction == targetFaction || site.Faction == FactionAffinity.Any;
+                }
+
+                if (factionMatch)
                 {
                     site.LastThreatSeenTime = Time.time;
                     site.RequestDeployState(true);

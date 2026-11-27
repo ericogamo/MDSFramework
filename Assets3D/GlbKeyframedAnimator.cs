@@ -162,6 +162,7 @@ namespace MDSFramework.Assets3D
                 }
 
                 if (suppressTurretOverrides &&
+                    ch.Path == GlbAnimationPath.Rotation &&
                     (ReferenceEquals(targetTf, rig.TurretBase) ||
                      ReferenceEquals(targetTf, rig.TurretHead) ||
                      ReferenceEquals(targetTf, rig.RadarDish)))

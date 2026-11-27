@@ -21,6 +21,7 @@ namespace MDSFramework.Deployment
         private static readonly Dictionary<UnitDefinition, AirdropCatalogEntry> EntriesByCargoDef = new Dictionary<UnitDefinition, AirdropCatalogEntry>();
         private static readonly Dictionary<string, AirdropCatalogEntry> EntriesByUnitId = new Dictionary<string, AirdropCatalogEntry>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, AirdropCatalogEntry> EntriesByKey = new Dictionary<string, AirdropCatalogEntry>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, AirdropCatalogEntry> EntriesByDisplayName = new Dictionary<string, AirdropCatalogEntry>(StringComparer.OrdinalIgnoreCase);
 
         private static WeaponMount? cachedTemplateMount;
         private static UnitDefinition? cachedTemplateCargoDef;
@@ -120,6 +121,20 @@ namespace MDSFramework.Deployment
             }
         }
 
+        internal static bool TryGetEntryByDisplayName(string? displayName, out AirdropCatalogEntry entry)
+        {
+            if (!string.IsNullOrWhiteSpace(displayName))
+            {
+                lock (SyncLock)
+                {
+                    return EntriesByDisplayName.TryGetValue(displayName!.Trim(), out entry!);
+                }
+            }
+
+            entry = null!;
+            return false;
+        }
+
         internal static bool TryResolveMount(WeaponMount? mount, out AirdropCatalogEntry entry)
         {
             if (mount == null)
@@ -208,11 +223,6 @@ namespace MDSFramework.Deployment
             }
 
             return null;
-        }
-
-        private static void OnPackageRegistered(ContractorPackage _)
-        {
-            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
         }
 
         private static bool RegisterUnitEntryLocked(
@@ -346,6 +356,13 @@ namespace MDSFramework.Deployment
             EntriesByCargoDef[cargoDef] = entry;
             EntriesByKey[mountKey] = entry;
             EntriesByKey[cargoKey] = entry;
+            if (!string.IsNullOrWhiteSpace(spec.DisplayName) &&
+                (!EntriesByDisplayName.TryGetValue(spec.DisplayName, out AirdropCatalogEntry existingDn) ||
+                 string.Equals(existingDn.Spec.UnitId, spec.UnitId, StringComparison.OrdinalIgnoreCase)))
+            {
+                EntriesByDisplayName[spec.DisplayName] = entry;
+            }
+
             RegisteredMountCount = EntriesByUnitId.Count;
             return true;
         }
@@ -537,7 +554,7 @@ namespace MDSFramework.Deployment
                 }
             }
 
-            return hasAnyContainerSpawner && hasFullContainerOption;
+            return hasAnyContainerSpawner;
         }
 
         private static bool TryResolveContainerTemplate(

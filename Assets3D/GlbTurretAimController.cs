@@ -85,22 +85,14 @@ namespace MDSFramework.Assets3D
 
             if (stowRequested || !animator.TargetDeployed)
             {
-                float restYaw = NormalizeSignedAngle(animator.DeployedTurretBaseLocalRot.eulerAngles.y);
-                float restPitch = rig.TurretHead != null
-                    ? Mathf.Clamp(-NormalizeSignedAngle(animator.DeployedTurretHeadLocalRot.eulerAngles.x), minElevationDeg, maxElevationDeg)
-                    : 0f;
-
-                currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, restYaw, traverseRateDegPerSec * deltaTime);
-                currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, restPitch, elevationRateDegPerSec * deltaTime);
-                ApplyTurretRotations();
-                ReadyToStow = Mathf.Abs(Mathf.DeltaAngle(currentYawDeg, restYaw)) < 2.0f &&
-                              Mathf.Abs(currentPitchDeg - restPitch) < 2.0f;
+                ReadyToStow = TickStowReturn(deltaTime);
                 return;
             }
 
             ReadyToStow = false;
             if (!hasAimTarget)
             {
+                RunIdleSweep(deltaTime);
                 return;
             }
 
@@ -133,8 +125,8 @@ namespace MDSFramework.Assets3D
             {
                 Vector3 headEuler = animator.DeployedTurretHeadLocalRot.eulerAngles;
                 float rawX = NormalizeSignedAngle(headEuler.x);
-                currentPitchDeg = Mathf.Clamp(-rawX, minElevationDeg, maxElevationDeg);
-                targetPitchDeg = currentPitchDeg;
+                currentPitchDeg = -rawX;
+                targetPitchDeg = Mathf.Clamp(currentPitchDeg, minElevationDeg, maxElevationDeg);
             }
 
             if (rig.TurretBase != null)
@@ -151,7 +143,7 @@ namespace MDSFramework.Assets3D
         {
             if (rig == null || rig.TurretBase == null)
             {
-                IsOnTarget = true;
+                IsOnTarget = animator == null || animator.IsFullyDeployed;
                 return;
             }
 
@@ -160,7 +152,7 @@ namespace MDSFramework.Assets3D
             Vector3 worldDir = worldPos - origin;
             if (worldDir.sqrMagnitude < 0.01f)
             {
-                IsOnTarget = true;
+                IsOnTarget = animator == null || animator.IsFullyDeployed;
                 return;
             }
 
@@ -175,6 +167,7 @@ namespace MDSFramework.Assets3D
             desiredUnclampedPitchDeg = desiredPitch;
             targetPitchDeg = Mathf.Clamp(desiredPitch, minElevationDeg, maxElevationDeg);
             hasAimTarget = true;
+            IsOnTarget = (animator == null || animator.IsFullyDeployed) && IsWithinAimTolerance();
         }
 
         internal void ClearAim()
@@ -313,18 +306,7 @@ namespace MDSFramework.Assets3D
             if (stowRequested || !animator.TargetDeployed)
             {
                 // Return turret cleanly to deployed rest angles before closing clamshell roof.
-                float restYaw = NormalizeSignedAngle(animator.DeployedTurretBaseLocalRot.eulerAngles.y);
-                float restPitch = rig.TurretHead != null
-                    ? Mathf.Clamp(-NormalizeSignedAngle(animator.DeployedTurretHeadLocalRot.eulerAngles.x), minElevationDeg, maxElevationDeg)
-                    : 0f;
-
-                currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, restYaw, traverseRateDegPerSec * deltaTime);
-                currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, restPitch, elevationRateDegPerSec * deltaTime);
-                ApplyTurretRotations();
-
-                float yawErr = Mathf.Abs(Mathf.DeltaAngle(currentYawDeg, restYaw));
-                float pitchErr = Mathf.Abs(currentPitchDeg - restPitch);
-                ReadyToStow = yawErr < 2.0f && pitchErr < 2.0f;
+                ReadyToStow = TickStowReturn(deltaTime);
                 IsOnTarget = false;
                 return;
             }
@@ -332,14 +314,7 @@ namespace MDSFramework.Assets3D
             ReadyToStow = false;
             if (!hasAimTarget)
             {
-                float restYaw = NormalizeSignedAngle(animator.DeployedTurretBaseLocalRot.eulerAngles.y);
-                idleSweepTime += deltaTime * 0.22f;
-                float sweepYaw = NormalizeSignedAngle(restYaw + (Mathf.Sin(idleSweepTime) * 45f));
-                float sweepPitch = Mathf.Clamp(12f, minElevationDeg, maxElevationDeg);
-
-                currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, sweepYaw, traverseRateDegPerSec * 0.45f * deltaTime);
-                currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, sweepPitch, elevationRateDegPerSec * 0.45f * deltaTime);
-                ApplyTurretRotations();
+                RunIdleSweep(deltaTime);
                 IsOnTarget = false;
                 return;
             }
@@ -347,13 +322,56 @@ namespace MDSFramework.Assets3D
             currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, targetYawDeg, traverseRateDegPerSec * deltaTime);
             currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, targetPitchDeg, elevationRateDegPerSec * deltaTime);
             ApplyTurretRotations();
+            IsOnTarget = IsWithinAimTolerance();
+        }
 
+        private bool TickStowReturn(float deltaTime)
+        {
+            float restYaw = animator != null
+                ? NormalizeSignedAngle(animator.DeployedTurretBaseLocalRot.eulerAngles.y)
+                : 0f;
+            float restPitch = (rig != null && rig.TurretHead != null && animator != null)
+                ? -NormalizeSignedAngle(animator.DeployedTurretHeadLocalRot.eulerAngles.x)
+                : 0f;
+
+            currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, restYaw, traverseRateDegPerSec * deltaTime);
+            currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, restPitch, elevationRateDegPerSec * deltaTime);
+
+            float yawErr = Mathf.Abs(Mathf.DeltaAngle(currentYawDeg, restYaw));
+            float pitchErr = Mathf.Abs(currentPitchDeg - restPitch);
+            bool ready = yawErr < 2.0f && pitchErr < 2.0f;
+            if (ready)
+            {
+                currentYawDeg = restYaw;
+                currentPitchDeg = restPitch;
+            }
+
+            ApplyTurretRotations();
+            return ready;
+        }
+
+        private void RunIdleSweep(float deltaTime)
+        {
+            float restYaw = animator != null
+                ? NormalizeSignedAngle(animator.DeployedTurretBaseLocalRot.eulerAngles.y)
+                : 0f;
+            idleSweepTime += deltaTime * 0.22f;
+            float sweepYaw = NormalizeSignedAngle(restYaw + (Mathf.Sin(idleSweepTime) * 45f));
+            float sweepPitch = Mathf.Clamp(12f, minElevationDeg, maxElevationDeg);
+
+            currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, sweepYaw, traverseRateDegPerSec * 0.45f * deltaTime);
+            currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, sweepPitch, elevationRateDegPerSec * 0.45f * deltaTime);
+            ApplyTurretRotations();
+        }
+
+        private bool IsWithinAimTolerance()
+        {
             float refPitch = (minElevationDeg >= 15f && desiredUnclampedPitchDeg >= -20f)
                 ? targetPitchDeg
                 : desiredUnclampedPitchDeg;
             float aimYawErr = Mathf.Abs(Mathf.DeltaAngle(currentYawDeg, targetYawDeg));
             float aimPitchErr = Mathf.Abs(currentPitchDeg - refPitch);
-            IsOnTarget = aimYawErr <= 3.5f && aimPitchErr <= 3.5f;
+            return aimYawErr <= 3.5f && aimPitchErr <= 3.5f;
         }
 
         private void ApplyTurretRotations()
@@ -365,13 +383,19 @@ namespace MDSFramework.Assets3D
 
             if (rig.TurretBase != null)
             {
-                rig.TurretBase.localRotation = Quaternion.Euler(0f, currentYawDeg, 0f);
+                Quaternion restBaseRot = animator != null ? animator.DeployedTurretBaseLocalRot : Quaternion.identity;
+                float restYaw = NormalizeSignedAngle(restBaseRot.eulerAngles.y);
+                float deltaYaw = Mathf.DeltaAngle(restYaw, currentYawDeg);
+                rig.TurretBase.localRotation = Quaternion.Euler(0f, deltaYaw, 0f) * restBaseRot;
             }
 
             if (rig.TurretHead != null)
             {
+                Quaternion restHeadRot = animator != null ? animator.DeployedTurretHeadLocalRot : Quaternion.identity;
+                float restPitch = -NormalizeSignedAngle(restHeadRot.eulerAngles.x);
+                float deltaPitch = currentPitchDeg - restPitch;
                 // Negative X rotation elevates +Z forward axis upward in Unity's left-handed frame.
-                rig.TurretHead.localRotation = Quaternion.Euler(-currentPitchDeg, 0f, 0f);
+                rig.TurretHead.localRotation = Quaternion.Euler(-deltaPitch, 0f, 0f) * restHeadRot;
             }
         }
 

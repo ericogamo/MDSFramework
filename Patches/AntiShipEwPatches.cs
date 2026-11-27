@@ -71,26 +71,35 @@ namespace MDSFramework.Patches
         }
     }
 
+    internal static class AntiShipEwPatchHelpers
+    {
+        internal static bool TryBypassVanillaSeek(MissileSeeker? seeker)
+        {
+            if (seeker == null)
+            {
+                return false;
+            }
+
+            Missile? missile = GameInteropHelpers.SeekerMissileField?.GetValue(seeker) as Missile;
+            if (missile != null &&
+                CustomMissileTracker.TryGet(missile, out CustomMissileBehavior beh) &&
+                (beh.Spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive ||
+                 beh.Spec.FlightProfile == MissileFlightProfile.LoiteringTopAttack))
+            {
+                beh.RunCruiseSeekerHousekeeping();
+                return true;
+            }
+
+            return false;
+        }
+    }
+
     [HarmonyPatch(typeof(OpticalSeekerCruiseMissile), nameof(OpticalSeekerCruiseMissile.Seek))]
     internal static class OpticalSeekerCruiseMissileSeaWraithBypassPatch
     {
         private static bool Prefix(OpticalSeekerCruiseMissile __instance)
         {
-            if (__instance == null)
-            {
-                return true;
-            }
-
-            Missile? missile = GameInteropHelpers.SeekerMissileField?.GetValue(__instance) as Missile;
-            if (missile != null &&
-                CustomMissileTracker.TryGet(missile, out CustomMissileBehavior beh) &&
-                beh.Spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive)
-            {
-                beh.RunCruiseSeekerHousekeeping();
-                return false;
-            }
-
-            return true;
+            return !AntiShipEwPatchHelpers.TryBypassVanillaSeek(__instance);
         }
     }
 
@@ -99,21 +108,7 @@ namespace MDSFramework.Patches
     {
         private static bool Prefix(ARHSeeker __instance)
         {
-            if (__instance == null)
-            {
-                return true;
-            }
-
-            Missile? missile = GameInteropHelpers.SeekerMissileField?.GetValue(__instance) as Missile;
-            if (missile != null &&
-                CustomMissileTracker.TryGet(missile, out CustomMissileBehavior beh) &&
-                beh.Spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive)
-            {
-                beh.RunCruiseSeekerHousekeeping();
-                return false;
-            }
-
-            return true;
+            return !AntiShipEwPatchHelpers.TryBypassVanillaSeek(__instance);
         }
     }
 }

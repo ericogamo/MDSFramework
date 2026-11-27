@@ -1,3 +1,4 @@
+using System;
 using HarmonyLib;
 using MDSFramework.Missiles;
 using UnityEngine;
@@ -5,25 +6,44 @@ using UnityEngine;
 namespace MDSFramework.Patches
 {
     [HarmonyPatch(typeof(Laser), "FixedUpdate")]
-    internal static class LaserThermalHardeningPatch
+    internal static class LaserThermalHardeningScopePatch
     {
-        private struct SavedLaserStats
+        [ThreadStatic]
+        private static int laserFixedUpdateDepth;
+
+        internal static bool IsInsideLaserFixedUpdate => laserFixedUpdateDepth > 0;
+
+        private static void Prefix()
         {
-            internal bool Modified;
-            internal float OriginalBlastDamage;
-            internal float OriginalFireDamage;
+            laserFixedUpdateDepth++;
         }
 
-        private static void Prefix(Laser __instance, out SavedLaserStats __state)
+        private static void Finalizer()
         {
-            __state = default;
-            if (!GameInteropHelpers.IsServerAuthority() || !MdsConfig.EnableLaserDwell.Value || __instance == null)
+            if (laserFixedUpdateDepth > 0)
+            {
+                laserFixedUpdateDepth--;
+            }
+        }
+    }
+
+    [HarmonyPatch(
+        typeof(Missile),
+        nameof(Missile.TakeDamage),
+        new[] { typeof(float), typeof(float), typeof(float), typeof(float), typeof(float), typeof(PersistentID) })]
+    internal static class LaserThermalHardeningPatch
+    {
+        private static void Prefix(Missile __instance, ref float blastDamage, ref float fireDamage)
+        {
+            if (!LaserThermalHardeningScopePatch.IsInsideLaserFixedUpdate ||
+                !GameInteropHelpers.IsServerAuthority() ||
+                !MdsConfig.EnableLaserDwell.Value ||
+                __instance == null)
             {
                 return;
             }
 
-            Unit? target = GameInteropHelpers.LaserCurrentTargetField?.GetValue(__instance) as Unit;
-            if (target == null || !CustomMissileTracker.TryGet(target, out CustomMissileBehavior custom))
+            if (!CustomMissileTracker.TryGet(__instance, out CustomMissileBehavior custom))
             {
                 return;
             }
@@ -34,34 +54,22 @@ namespace MDSFramework.Patches
                 return;
             }
 
-            float scale = 1f / Mathf.Max(0.25f, hardening);
-            if (GameInteropHelpers.LaserBlastDamageField != null && GameInteropHelpers.LaserFireDamageField != null)
-            {
-                object? bRaw = GameInteropHelpers.LaserBlastDamageField.GetValue(__instance);
-                object? fRaw = GameInteropHelpers.LaserFireDamageField.GetValue(__instance);
-                if (bRaw is float b && fRaw is float f)
-                {
-                    __state = new SavedLaserStats
-                    {
-                        Modified = true,
-                        OriginalBlastDamage = b,
-                        OriginalFireDamage = f
-                    };
-                    GameInteropHelpers.LaserBlastDamageField.SetValue(__instance, b * scale);
-                    GameInteropHelpers.LaserFireDamageField.SetValue(__instance, f * scale);
-                }
-            }
-        }
+            // Apply hardening on the actual hit missile and only to damage exceeding armor thresholds,
+            // so per-tick laser damage is not pushed below armor thresholds into complete immunity.
+            ArmorProperties? armor = __instance.GetArmorProperties();
+            float blastArmor = armor != null ? armor.blastArmor : 0f;
+            float fireArmor = armor != null ? armor.fireArmor : 0f;
+            float invHardening = 1f / Mathf.Max(0.25f, hardening);
 
-        private static void Finalizer(Laser __instance, SavedLaserStats __state)
-        {
-            if (!__state.Modified || __instance == null)
+            if (blastDamage > blastArmor)
             {
-                return;
+                blastDamage = blastArmor + ((blastDamage - blastArmor) * invHardening);
             }
 
-            GameInteropHelpers.LaserBlastDamageField?.SetValue(__instance, __state.OriginalBlastDamage);
-            GameInteropHelpers.LaserFireDamageField?.SetValue(__instance, __state.OriginalFireDamage);
+            if (fireDamage > fireArmor)
+            {
+                fireDamage = fireArmor + ((fireDamage - fireArmor) * invHardening);
+            }
         }
     }
 }

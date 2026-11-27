@@ -18,7 +18,6 @@ namespace MDSFramework.Patches
             internal MountedMissile Mounted;
             internal AirMissileCatalogEntry Entry;
             internal string ExpectedPrefabName;
-            internal Vector3 OwnerPos;
             internal float ExpireTime;
         }
 
@@ -31,12 +30,16 @@ namespace MDSFramework.Patches
 
         internal static void RecordFire(Unit owner, MountedMissile mounted, AirMissileCatalogEntry entry)
         {
-            if (!GameInteropHelpers.IsServerAuthority())
+            if (!GameInteropHelpers.IsServerAuthority() ||
+                owner == null ||
+                mounted == null ||
+                !mounted.gameObject.activeInHierarchy)
             {
                 return;
             }
 
             PurgeExpired();
+            RemoveForMounted(mounted);
             string expectedPrefab = entry.ClonedInfo?.weaponPrefab != null ? entry.ClonedInfo.weaponPrefab.name : string.Empty;
             Pending.Add(new PendingAirLaunch
             {
@@ -44,9 +47,24 @@ namespace MDSFramework.Patches
                 Mounted = mounted,
                 Entry = entry,
                 ExpectedPrefabName = expectedPrefab,
-                OwnerPos = owner.transform.position,
                 ExpireTime = Time.unscaledTime + 12f
             });
+        }
+
+        internal static void RemoveForMounted(MountedMissile? mounted)
+        {
+            if (mounted == null)
+            {
+                return;
+            }
+
+            for (int i = Pending.Count - 1; i >= 0; i--)
+            {
+                if (ReferenceEquals(Pending[i].Mounted, mounted))
+                {
+                    Pending.RemoveAt(i);
+                }
+            }
         }
 
         internal static bool TryConsume(Unit? owner, GameObject? missilePrefab, Vector3 spawnPos, out AirMissileCatalogEntry entry)
@@ -60,6 +78,11 @@ namespace MDSFramework.Patches
             for (int i = 0; i < Pending.Count; i++)
             {
                 PendingAirLaunch item = Pending[i];
+                if (item.Mounted == null || !item.Mounted.gameObject.activeInHierarchy)
+                {
+                    continue;
+                }
+
                 if (owner != null && !ReferenceEquals(item.Owner, owner))
                 {
                     continue;
@@ -72,9 +95,7 @@ namespace MDSFramework.Patches
                     continue;
                 }
 
-                Vector3 refPos = item.Mounted != null
-                    ? item.Mounted.transform.position
-                    : (item.Owner != null ? item.Owner.transform.position : item.OwnerPos);
+                Vector3 refPos = item.Mounted.transform.position;
                 float dSq = (refPos - spawnPos).sqrMagnitude;
                 if (dSq < bestDistSq)
                 {
@@ -99,11 +120,35 @@ namespace MDSFramework.Patches
             float now = Time.unscaledTime;
             for (int i = Pending.Count - 1; i >= 0; i--)
             {
-                if (Pending[i].ExpireTime < now || Pending[i].Owner == null)
+                PendingAirLaunch item = Pending[i];
+                if (item.ExpireTime < now ||
+                    item.Owner == null ||
+                    item.Mounted == null ||
+                    !item.Mounted.gameObject.activeInHierarchy)
                 {
                     Pending.RemoveAt(i);
                 }
             }
+        }
+    }
+
+    internal sealed class MountedMissileLaunchCleanup : MonoBehaviour
+    {
+        private MountedMissile? mounted;
+
+        private void Awake()
+        {
+            mounted = GetComponent<MountedMissile>();
+        }
+
+        private void OnDisable()
+        {
+            AirMissileLaunchTracker.RemoveForMounted(mounted ?? GetComponent<MountedMissile>());
+        }
+
+        private void OnDestroy()
+        {
+            AirMissileLaunchTracker.RemoveForMounted(mounted);
         }
     }
 
@@ -192,8 +237,17 @@ namespace MDSFramework.Patches
         new[] { typeof(Unit), typeof(Unit), typeof(Vector3), typeof(WeaponStation), typeof(GlobalPosition) })]
     internal static class MountedMissileFireSeaWraithPatch
     {
-        private static bool Prefix(MountedMissile __instance, Unit owner, Unit target)
+        private struct PendingFireState
         {
+            internal AirMissileCatalogEntry? Entry;
+            internal bool WasFired;
+        }
+
+        private static readonly FieldInfo? MountedMissileFiredField = AccessTools.Field(typeof(MountedMissile), "fired");
+
+        private static bool Prefix(MountedMissile __instance, Unit owner, Unit target, out PendingFireState __state)
+        {
+            __state = default;
             if (__instance == null || owner == null)
             {
                 return true;
@@ -203,27 +257,64 @@ namespace MDSFramework.Patches
             if (AircraftMissileCatalogManager.TryResolveMount(resolvedMount, out AirMissileCatalogEntry entry) ||
                 AircraftMissileCatalogManager.TryResolveInfo(__instance.info, out entry))
             {
-                bool isLocalOrSingleplayer = owner.HasAuthority || GameManager.gameState == GameState.SinglePlayer;
-                bool isRemoteClientOnServer = owner.IsServer && !owner.HasAuthority && GameManager.gameState == GameState.Multiplayer;
-                if (entry.Spec.IsAntiShip && isLocalOrSingleplayer && !AntiShipTargetingPatches.IsValidAntiShipTarget(target))
+                if (entry.Spec.IsAntiShip && !AntiShipTargetingPatches.IsTargetAllowedForLaunch(owner, target))
                 {
-                    string weaponName = string.IsNullOrEmpty(entry.ClonedInfo.shortName)
-                        ? entry.Spec.DisplayName
-                        : entry.ClonedInfo.shortName;
-                    AntiShipTargetingPatches.ReportShipsOnlyIfLocalPlayer(owner, weaponName);
+                    bool isLocalOrSingleplayer = owner.HasAuthority || GameManager.gameState == GameState.SinglePlayer;
+                    if (isLocalOrSingleplayer)
+                    {
+                        string weaponName = string.IsNullOrEmpty(entry.ClonedInfo.shortName)
+                            ? entry.Spec.DisplayName
+                            : entry.ClonedInfo.shortName;
+                        AntiShipTargetingPatches.ReportShipsOnlyIfLocalPlayer(owner, weaponName);
+                    }
+
                     return false;
                 }
 
-                // On server handling a remote client's CmdLaunchMissile, accept recently disabled Ships so ammo/mass doesn't split-brain.
-                if (entry.Spec.IsAntiShip && isRemoteClientOnServer && !(target is Ship))
+                bool wasFired = MountedMissileFiredField?.GetValue(__instance) is bool f && f;
+                __state = new PendingFireState
                 {
-                    return false;
-                }
-
-                AirMissileLaunchTracker.RecordFire(owner, __instance, entry);
+                    Entry = entry,
+                    WasFired = wasFired
+                };
             }
 
             return true;
+        }
+
+        private static void Postfix(MountedMissile __instance, Unit owner, bool __runOriginal, PendingFireState __state)
+        {
+            if (!__runOriginal ||
+                __state.Entry == null ||
+                __state.WasFired ||
+                __instance == null ||
+                owner == null ||
+                !GameInteropHelpers.IsServerAuthority())
+            {
+                return;
+            }
+
+            bool firedNow = MountedMissileFiredField?.GetValue(__instance) is bool f && f;
+            if (!firedNow || !__instance.IsAttached() || !__instance.gameObject.activeInHierarchy)
+            {
+                return;
+            }
+
+            if (__instance.GetComponent<MountedMissileLaunchCleanup>() == null)
+            {
+                __instance.gameObject.AddComponent<MountedMissileLaunchCleanup>();
+            }
+
+            AirMissileLaunchTracker.RecordFire(owner, __instance, __state.Entry);
+        }
+    }
+
+    [HarmonyPatch(typeof(MountedMissile), "OnDestroy")]
+    internal static class MountedMissileOnDestroyCleanupPatch
+    {
+        private static void Prefix(MountedMissile __instance)
+        {
+            AirMissileLaunchTracker.RemoveForMounted(__instance);
         }
     }
 

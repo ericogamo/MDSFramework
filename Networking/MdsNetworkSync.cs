@@ -47,6 +47,9 @@ namespace MDSFramework.Networking
             internal int ActiveFcuCnt;
             internal int EffCnt;
             internal int NetId;
+            internal int UnitYaw10;
+            internal int Len100;
+            internal int Eccm100;
         }
 
         private static bool messageRegistered;
@@ -68,11 +71,19 @@ namespace MDSFramework.Networking
         private static readonly Dictionary<uint, SiteSyncState> LastSentSiteStates = new Dictionary<uint, SiteSyncState>();
         private static readonly HashSet<uint> DirtySiteIds = new HashSet<uint>();
         private static readonly Dictionary<uint, float> LastBeamSentAt = new Dictionary<uint, float>();
+        private static readonly HashSet<uint> LiveSitePidsScratch = new HashSet<uint>();
+        private static readonly List<uint> DeadPidsScratch = new List<uint>();
+        private static readonly Dictionary<uint, (float YawDeg, float LengthMeters)> RecordedLandedContainers = new Dictionary<uint, (float, float)>();
+        private static readonly HashSet<uint> IgnitedAirDropMissiles = new HashSet<uint>();
+        private static readonly Dictionary<uint, (float YawDeg, float LengthMeters, float ExpiresAt)> PendingClientContainerLandings =
+            new Dictionary<uint, (float, float, float)>();
+        private static readonly Dictionary<uint, float> PendingClientMissileIgnitions = new Dictionary<uint, float>();
         private static readonly List<string> BatchScratch = new List<string>(32);
 
         private static readonly Dictionary<string, FactionAffinity> SavedLocalPackageFactions = new Dictionary<string, FactionAffinity>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, FactionAffinity> RemotePackageFactions = new Dictionary<string, FactionAffinity>(StringComparer.OrdinalIgnoreCase);
 
+        private static string[]? pendingHelloArgs;
         private static float nextHelloAt;
         private static float nextSiteSyncAt;
         private static float nextFullSiteSyncAt;
@@ -142,22 +153,31 @@ namespace MDSFramework.Networking
             }
         }
 
-        internal static void ResetSession()
+        internal static void ResetSession(bool preserveActiveServerConnection = false)
         {
-            ModdedGuests.Clear();
+            if (!preserveActiveServerConnection)
+            {
+                ModdedGuests.Clear();
+                RestoreLocalPackageFactions();
+                RemotePackageFactions.Clear();
+                HostHasMds = false;
+                CatalogMismatchWarning = null;
+                RemoteEnableNativeAircraftAirdrop = true;
+                RemoteEnableMissionEditorCatalog = true;
+                RemoteEnableAutoPopUp = true;
+            }
+
             KnownAuthPlayers.Clear();
             PieceBuffers.Clear();
             PieceStartedAt.Clear();
             LastSentSiteStates.Clear();
             DirtySiteIds.Clear();
             LastBeamSentAt.Clear();
-            RestoreLocalPackageFactions();
-            RemotePackageFactions.Clear();
-            HostHasMds = false;
-            CatalogMismatchWarning = null;
-            RemoteEnableNativeAircraftAirdrop = true;
-            RemoteEnableMissionEditorCatalog = true;
-            RemoteEnableAutoPopUp = true;
+            RecordedLandedContainers.Clear();
+            IgnitedAirDropMissiles.Clear();
+            PendingClientContainerLandings.Clear();
+            PendingClientMissileIgnitions.Clear();
+            pendingHelloArgs = null;
             lastAbmWarnDigest = string.Empty;
             nextHelloAt = 0f;
             nextSiteSyncAt = 0f;
@@ -218,13 +238,29 @@ namespace MDSFramework.Networking
                 boundServer.RegisterHandler<MdsNetMessage>(OnHostMessage, allowUnauthenticated: false);
             }
 
+            if (!GameInteropHelpers.IsGameplaySceneReady())
+            {
+                return;
+            }
+
             float now = Time.unscaledTime;
             IReadOnlyList<INetworkPlayer> players = server.AuthenticatedPlayers;
             bool newPlayerJoined = false;
             for (int i = 0; i < players.Count; i++)
             {
                 INetworkPlayer p = players[i];
-                if (p != null && !p.IsHost && KnownAuthPlayers.Add(p))
+                if (p == null || p.IsHost)
+                {
+                    continue;
+                }
+
+                if (!p.SceneIsReady)
+                {
+                    KnownAuthPlayers.Remove(p);
+                    continue;
+                }
+
+                if (KnownAuthPlayers.Add(p))
                 {
                     newPlayerJoined = true;
                 }
@@ -249,6 +285,7 @@ namespace MDSFramework.Networking
                 if (forceFull)
                 {
                     nextFullSiteSyncAt = now + FullSyncIntervalSeconds;
+                    PruneDeadIgnitedMissiles();
                 }
 
                 FlushSiteSync(forceFull, targetPlayer: null);
@@ -262,6 +299,18 @@ namespace MDSFramework.Networking
             {
                 boundClient = client.MessageHandler;
                 boundClient.RegisterHandler<MdsNetMessage>(OnGuestMessage, allowUnauthenticated: false);
+            }
+
+            if (pendingHelloArgs != null && GameInteropHelpers.IsGameplaySceneReady())
+            {
+                string[] queued = pendingHelloArgs;
+                pendingHelloArgs = null;
+                HandleHelloOnClient(queued);
+            }
+
+            if (HostHasMds)
+            {
+                ProcessPendingClientEvents();
             }
         }
 
@@ -311,6 +360,11 @@ namespace MDSFramework.Networking
             }
 
             uint pid = site.Unit.persistentID.Id;
+            if (!GameInteropHelpers.IsGameplaySceneReady())
+            {
+                return;
+            }
+
             float now = Time.unscaledTime;
             if (LastBeamSentAt.TryGetValue(pid, out float prevAt) && now - prevAt < 0.12f)
             {
@@ -360,7 +414,14 @@ namespace MDSFramework.Networking
 
         internal static void BroadcastContainerLanded(uint persistentId, float yawDeg, float lengthMeters)
         {
-            if (!messageRegistered || ModdedGuests.Count == 0 || !GameInteropHelpers.IsServerAuthority() || persistentId == 0)
+            if (!GameInteropHelpers.IsServerAuthority() || persistentId == 0)
+            {
+                return;
+            }
+
+            RecordedLandedContainers[persistentId] = (yawDeg, lengthMeters);
+
+            if (!messageRegistered || ModdedGuests.Count == 0)
             {
                 return;
             }
@@ -375,7 +436,14 @@ namespace MDSFramework.Networking
 
         internal static void BroadcastMissileIgnition(uint persistentId)
         {
-            if (!messageRegistered || ModdedGuests.Count == 0 || !GameInteropHelpers.IsServerAuthority() || persistentId == 0)
+            if (!GameInteropHelpers.IsServerAuthority() || persistentId == 0)
+            {
+                return;
+            }
+
+            IgnitedAirDropMissiles.Add(persistentId);
+
+            if (!messageRegistered || ModdedGuests.Count == 0)
             {
                 return;
             }
@@ -398,7 +466,7 @@ namespace MDSFramework.Networking
             for (int i = 0; i < players.Count; i++)
             {
                 INetworkPlayer p = players[i];
-                if (p != null && !p.IsHost)
+                if (p != null && !p.IsHost && p.SceneIsReady)
                 {
                     SendToPlayer(p, payload);
                 }
@@ -474,10 +542,19 @@ namespace MDSFramework.Networking
             SensorNetworkManager? mgr = SensorNetworkManager.Instance;
             if (mgr == null || mgr.AllSites.Count == 0)
             {
+                if (targetPlayer == null)
+                {
+                    LastSentSiteStates.Clear();
+                    DirtySiteIds.Clear();
+                    LastBeamSentAt.Clear();
+                    RecordedLandedContainers.Clear();
+                }
+
                 return;
             }
 
             BatchScratch.Clear();
+            LiveSitePidsScratch.Clear();
             IReadOnlyList<ModularSiteBehavior> sites = mgr.AllSites;
             for (int i = 0; i < sites.Count; i++)
             {
@@ -488,6 +565,9 @@ namespace MDSFramework.Networking
                 }
 
                 uint pid = site.Unit.persistentID.Id;
+                LiveSitePidsScratch.Add(pid);
+
+                bool isLandedContainer = site.Unit is Container && !site.SuspendedInTransit;
                 int flags = 0;
                 if (site.PopUpRequested) flags |= 1 << 0;
                 if (site.IsRadarEmitting) flags |= 1 << 1;
@@ -497,6 +577,7 @@ namespace MDSFramework.Networking
                 if (site.HasActiveFcuLink) flags |= 1 << 5;
                 if (site.IsVehicleMoving) flags |= 1 << 6;
                 if (site.Animator != null && site.Animator.TargetDeployed) flags |= 1 << 7;
+                if (isLandedContainer) flags |= 1 << 8;
 
                 int animPct = Mathf.RoundToInt(Mathf.Clamp01(site.Animator != null ? site.Animator.NormalizedProgress : 1f) * 100f);
                 int yaw10 = Mathf.RoundToInt((site.TurretAim != null ? site.TurretAim.CurrentYawDeg : 0f) * 10f);
@@ -508,6 +589,9 @@ namespace MDSFramework.Networking
                 int activeFcuCnt = site.CommandNetActiveFcuCount;
                 int effCnt = site.CommandNetEffectorCount;
                 int netId = site.CommandNetId;
+                int unitYaw10 = isLandedContainer ? Mathf.RoundToInt(site.Unit.transform.eulerAngles.y * 10f) : 0;
+                int len100 = isLandedContainer ? Mathf.RoundToInt(Mathf.Max(0f, site.Spec.ContainerLengthMeters) * 100f) : 0;
+                int eccm100 = Mathf.RoundToInt(Mathf.Clamp(site.EffectiveNetworkEccmBonus, 0f, 1f) * 100f);
 
                 bool dirty = forceFull || DirtySiteIds.Remove(pid);
                 if (!LastSentSiteStates.TryGetValue(pid, out SiteSyncState prev))
@@ -526,7 +610,10 @@ namespace MDSFramework.Networking
                          prev.FcuCnt != fcuCnt ||
                          prev.ActiveFcuCnt != activeFcuCnt ||
                          prev.EffCnt != effCnt ||
-                         prev.NetId != netId)
+                         prev.NetId != netId ||
+                         Math.Abs(prev.UnitYaw10 - unitYaw10) >= 5 ||
+                         Math.Abs(prev.Len100 - len100) >= 5 ||
+                         Math.Abs(prev.Eccm100 - eccm100) >= 1)
                 {
                     dirty = true;
                 }
@@ -549,6 +636,9 @@ namespace MDSFramework.Networking
                     prev.ActiveFcuCnt = activeFcuCnt;
                     prev.EffCnt = effCnt;
                     prev.NetId = netId;
+                    prev.UnitYaw10 = unitYaw10;
+                    prev.Len100 = len100;
+                    prev.Eccm100 = eccm100;
                 }
 
                 BatchScratch.Add(
@@ -563,7 +653,10 @@ namespace MDSFramework.Networking
                     $"{fcuCnt.ToString(CultureInfo.InvariantCulture)}," +
                     $"{activeFcuCnt.ToString(CultureInfo.InvariantCulture)}," +
                     $"{effCnt.ToString(CultureInfo.InvariantCulture)}," +
-                    $"{netId.ToString(CultureInfo.InvariantCulture)}");
+                    $"{netId.ToString(CultureInfo.InvariantCulture)}," +
+                    $"{unitYaw10.ToString(CultureInfo.InvariantCulture)}," +
+                    $"{len100.ToString(CultureInfo.InvariantCulture)}," +
+                    $"{eccm100.ToString(CultureInfo.InvariantCulture)}");
 
                 if (BatchScratch.Count >= 18)
                 {
@@ -576,6 +669,119 @@ namespace MDSFramework.Networking
             {
                 SendSiteBatch(BatchScratch, targetPlayer);
                 BatchScratch.Clear();
+            }
+
+            if (targetPlayer == null)
+            {
+                PruneDeadSiteTrackingEntries();
+            }
+        }
+
+        private static void PruneDeadSiteTrackingEntries()
+        {
+            DeadPidsScratch.Clear();
+            foreach (uint pid in LastSentSiteStates.Keys)
+            {
+                if (!LiveSitePidsScratch.Contains(pid))
+                {
+                    DeadPidsScratch.Add(pid);
+                }
+            }
+
+            for (int i = 0; i < DeadPidsScratch.Count; i++)
+            {
+                LastSentSiteStates.Remove(DeadPidsScratch[i]);
+            }
+
+            DeadPidsScratch.Clear();
+            foreach (uint pid in LastBeamSentAt.Keys)
+            {
+                if (!LiveSitePidsScratch.Contains(pid))
+                {
+                    DeadPidsScratch.Add(pid);
+                }
+            }
+
+            for (int i = 0; i < DeadPidsScratch.Count; i++)
+            {
+                LastBeamSentAt.Remove(DeadPidsScratch[i]);
+            }
+
+            DeadPidsScratch.Clear();
+            foreach (uint pid in DirtySiteIds)
+            {
+                if (!LiveSitePidsScratch.Contains(pid))
+                {
+                    DeadPidsScratch.Add(pid);
+                }
+            }
+
+            for (int i = 0; i < DeadPidsScratch.Count; i++)
+            {
+                DirtySiteIds.Remove(DeadPidsScratch[i]);
+            }
+
+            DeadPidsScratch.Clear();
+            foreach (uint pid in RecordedLandedContainers.Keys)
+            {
+                if (!LiveSitePidsScratch.Contains(pid))
+                {
+                    DeadPidsScratch.Add(pid);
+                }
+            }
+
+            for (int i = 0; i < DeadPidsScratch.Count; i++)
+            {
+                RecordedLandedContainers.Remove(DeadPidsScratch[i]);
+            }
+
+            DeadPidsScratch.Clear();
+        }
+
+        private static void PruneDeadIgnitedMissiles()
+        {
+            if (IgnitedAirDropMissiles.Count == 0)
+            {
+                return;
+            }
+
+            DeadPidsScratch.Clear();
+            foreach (uint pid in IgnitedAirDropMissiles)
+            {
+                if (!CustomMissileTracker.ActiveByUnitId.ContainsKey(pid))
+                {
+                    DeadPidsScratch.Add(pid);
+                }
+            }
+
+            for (int i = 0; i < DeadPidsScratch.Count; i++)
+            {
+                IgnitedAirDropMissiles.Remove(DeadPidsScratch[i]);
+            }
+
+            DeadPidsScratch.Clear();
+        }
+
+        private static void ReplayLateJoinEventsToPlayer(INetworkPlayer targetPlayer)
+        {
+            foreach (KeyValuePair<uint, (float YawDeg, float LengthMeters)> kv in RecordedLandedContainers)
+            {
+                var pid = new PersistentID { Id = kv.Key };
+                if (pid.TryGetUnit(out Unit unit) && unit != null && !unit.disabled)
+                {
+                    string payload = Join(
+                        "container_land",
+                        kv.Key.ToString(CultureInfo.InvariantCulture),
+                        kv.Value.YawDeg.ToString("0.##", CultureInfo.InvariantCulture),
+                        kv.Value.LengthMeters.ToString("0.##", CultureInfo.InvariantCulture));
+                    SendToPlayer(targetPlayer, payload);
+                }
+            }
+
+            PruneDeadIgnitedMissiles();
+            foreach (uint missilePid in IgnitedAirDropMissiles)
+            {
+                SendToPlayer(targetPlayer, Join("missile_ign", missilePid.ToString(CultureInfo.InvariantCulture)));
             }
         }
 
@@ -653,6 +859,11 @@ namespace MDSFramework.Networking
 
             if (verb == "hi")
             {
+                if (!GameInteropHelpers.IsGameplaySceneReady() || !sender.SceneIsReady)
+                {
+                    return;
+                }
+
                 bool added = ModdedGuests.Add(sender);
                 if (added)
                 {
@@ -661,6 +872,7 @@ namespace MDSFramework.Networking
 
                 FlushSiteSync(forceFull: true, targetPlayer: sender);
                 BroadcastAbmWarningsIfChanged(force: true, targetPlayer: sender);
+                ReplayLateJoinEventsToPlayer(sender);
                 return;
             }
 
@@ -686,6 +898,7 @@ namespace MDSFramework.Networking
                         {
                             bool hold = args[2] == "1";
                             site.SetHoldFire(hold);
+                            RtsBridgeHost.SyncMdsSiteHoldFireToRts?.Invoke(unit, hold);
                             MarkSiteDirty(site);
                             FlushSiteSync(forceFull: false, targetPlayer: null);
                         }
@@ -750,7 +963,31 @@ namespace MDSFramework.Networking
 
         private static void HandleHelloOnClient(string[] args)
         {
+            if (!GameInteropHelpers.IsGameplaySceneReady())
+            {
+                pendingHelloArgs = args;
+                return;
+            }
+
+            pendingHelloArgs = null;
             string hostProto = args.Length > 1 ? args[1] : string.Empty;
+            bool protoMatch = string.Equals(hostProto, WireProtocolVersion, StringComparison.Ordinal);
+            if (!protoMatch)
+            {
+                if (HostHasMds)
+                {
+                    RestoreLocalPackageFactions();
+                }
+
+                HostHasMds = false;
+                RemotePackageFactions.Clear();
+                RemoteEnableNativeAircraftAirdrop = true;
+                RemoteEnableMissionEditorCatalog = true;
+                RemoteEnableAutoPopUp = true;
+                MdsLog.Warn($"[Net] Protocol mismatch with host ('{hostProto}' != '{WireProtocolVersion}'). MDS sync disabled.");
+                return;
+            }
+
             uint hostCatalogHash = args.Length > 2 && uint.TryParse(args[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint h) ? h : 0u;
             string pkgFactions = args.Length > 3 ? args[3] : string.Empty;
             RemoteEnableNativeAircraftAirdrop = args.Length <= 4 || args[4] == "1";
@@ -772,8 +1009,8 @@ namespace MDSFramework.Networking
             ApplyRemotePackageFactions(pkgFactions);
 
             bool firstHandshake = !HostHasMds;
-            HostHasMds = string.Equals(hostProto, WireProtocolVersion, StringComparison.Ordinal);
-            if (HostHasMds && firstHandshake)
+            HostHasMds = true;
+            if (firstHandshake)
             {
                 MdsLog.Info($"[Net] Connected to MDS host ({hostProto}, hash={hostCatalogHash:x8}). Sending 'hi'.");
                 SendToHost(Join("hi", WireProtocolVersion, MdsCatalogCoordinator.CatalogWireHash.ToString(CultureInfo.InvariantCulture)));
@@ -873,17 +1110,12 @@ namespace MDSFramework.Networking
                 int activeFcuCnt = ParseInt(cols[9]);
                 int effCnt = ParseInt(cols[10]);
                 int netId = ParseInt(cols[11]);
+                bool isLandedContainer = (flags & (1 << 8)) != 0;
+                float unitYawDeg = cols.Length >= 13 ? ParseInt(cols[12]) / 10f : 0f;
+                float containerLength = cols.Length >= 14 ? ParseInt(cols[13]) / 100f : 0f;
+                float eccmBonus = cols.Length >= 15 ? ParseInt(cols[14]) / 100f : 0f;
 
-                MdsClientSiteProxy? proxy = MdsClientSiteProxy.FindByPersistentId(pidId);
-                if (proxy == null)
-                {
-                    var pid = new PersistentID { Id = pidId };
-                    if (pid.TryGetUnit(out Unit unit) && unit != null)
-                    {
-                        proxy = unit.GetComponent<MdsClientSiteProxy>();
-                    }
-                }
-
+                MdsClientSiteProxy? proxy = FindClientProxy(pidId);
                 proxy?.ApplyNetworkSnapshot(
                     flags,
                     animPct,
@@ -895,7 +1127,11 @@ namespace MDSFramework.Networking
                     fcuCnt,
                     activeFcuCnt,
                     effCnt,
-                    netId);
+                    netId,
+                    isLandedContainer,
+                    unitYawDeg,
+                    containerLength,
+                    eccmBonus);
             }
         }
 
@@ -971,20 +1207,23 @@ namespace MDSFramework.Networking
             }
 
             uint pidId = ParseUInt(args[1]);
+            if (pidId == 0)
+            {
+                return;
+            }
+
             float yawDeg = ParseFloat(args[2]);
             float lenMeters = ParseFloat(args[3]);
 
-            MdsClientSiteProxy? proxy = MdsClientSiteProxy.FindByPersistentId(pidId);
-            if (proxy == null)
+            MdsClientSiteProxy? proxy = FindClientProxy(pidId);
+            if (proxy != null)
             {
-                var pid = new PersistentID { Id = pidId };
-                if (pid.TryGetUnit(out Unit unit) && unit != null)
-                {
-                    proxy = unit.GetComponent<MdsClientSiteProxy>();
-                }
+                PendingClientContainerLandings.Remove(pidId);
+                proxy.ApplyContainerLanded(yawDeg, lenMeters);
+                return;
             }
 
-            proxy?.ApplyContainerLanded(yawDeg, lenMeters);
+            PendingClientContainerLandings[pidId] = (yawDeg, lenMeters, Time.unscaledTime + 12f);
         }
 
         private static void HandleMissileIgnitionOnClient(string[] args)
@@ -1003,7 +1242,97 @@ namespace MDSFramework.Networking
             var pid = new PersistentID { Id = pidId };
             if (pid.TryGetUnit(out Unit unit) && unit is Missile m && CustomMissileTracker.TryGet(m, out CustomMissileBehavior beh))
             {
+                PendingClientMissileIgnitions.Remove(pidId);
                 beh.ForceClientMotorIgnition();
+                return;
+            }
+
+            PendingClientMissileIgnitions[pidId] = Time.unscaledTime + 12f;
+        }
+
+        private static MdsClientSiteProxy? FindClientProxy(uint pidId)
+        {
+            MdsClientSiteProxy? proxy = MdsClientSiteProxy.FindByPersistentId(pidId);
+            if (proxy != null)
+            {
+                return proxy;
+            }
+
+            var pid = new PersistentID { Id = pidId };
+            if (pid.TryGetUnit(out Unit unit) && unit != null)
+            {
+                return unit.GetComponent<MdsClientSiteProxy>();
+            }
+
+            return null;
+        }
+
+        private static void ProcessPendingClientEvents()
+        {
+            if (PendingClientContainerLandings.Count == 0 && PendingClientMissileIgnitions.Count == 0)
+            {
+                return;
+            }
+
+            if (!GameInteropHelpers.IsGameplaySceneReady())
+            {
+                return;
+            }
+
+            float now = Time.unscaledTime;
+
+            if (PendingClientContainerLandings.Count > 0)
+            {
+                DeadPidsScratch.Clear();
+                foreach (KeyValuePair<uint, (float YawDeg, float LengthMeters, float ExpiresAt)> kv in PendingClientContainerLandings)
+                {
+                    if (now > kv.Value.ExpiresAt)
+                    {
+                        DeadPidsScratch.Add(kv.Key);
+                        continue;
+                    }
+
+                    MdsClientSiteProxy? proxy = FindClientProxy(kv.Key);
+                    if (proxy != null)
+                    {
+                        proxy.ApplyContainerLanded(kv.Value.YawDeg, kv.Value.LengthMeters);
+                        DeadPidsScratch.Add(kv.Key);
+                    }
+                }
+
+                for (int i = 0; i < DeadPidsScratch.Count; i++)
+                {
+                    PendingClientContainerLandings.Remove(DeadPidsScratch[i]);
+                }
+
+                DeadPidsScratch.Clear();
+            }
+
+            if (PendingClientMissileIgnitions.Count > 0)
+            {
+                DeadPidsScratch.Clear();
+                foreach (KeyValuePair<uint, float> kv in PendingClientMissileIgnitions)
+                {
+                    if (now > kv.Value)
+                    {
+                        DeadPidsScratch.Add(kv.Key);
+                        continue;
+                    }
+
+                    var pid = new PersistentID { Id = kv.Key };
+                    if (pid.TryGetUnit(out Unit unit) && unit is Missile m && CustomMissileTracker.TryGet(m, out CustomMissileBehavior beh))
+                    {
+                        beh.ForceClientMotorIgnition();
+                        DeadPidsScratch.Add(kv.Key);
+                    }
+                }
+
+                for (int i = 0; i < DeadPidsScratch.Count; i++)
+                {
+                    PendingClientMissileIgnitions.Remove(DeadPidsScratch[i]);
+                }
+
+                DeadPidsScratch.Clear();
             }
         }
 
@@ -1045,7 +1374,7 @@ namespace MDSFramework.Networking
         {
             foreach (INetworkPlayer player in ModdedGuests)
             {
-                if (player != null && !player.IsHost)
+                if (player != null && !player.IsHost && player.SceneIsReady)
                 {
                     SendToPlayer(player, text);
                 }
@@ -1085,6 +1414,13 @@ namespace MDSFramework.Networking
                 }
 
                 SplitByBytes(text, MaxWireBytes - 64, PieceScratch);
+                if (PieceScratch.Count > MaxPiecesPerPayload)
+                {
+                    MdsLog.Warn($"[Net] Dropping oversized payload ({PieceScratch.Count} pieces > max {MaxPiecesPerPayload}).");
+                    PieceScratch.Clear();
+                    return;
+                }
+
                 string pid = (nextPieceId++).ToString(CultureInfo.InvariantCulture);
                 string total = PieceScratch.Count.ToString(CultureInfo.InvariantCulture);
                 for (int i = 0; i < PieceScratch.Count; i++)

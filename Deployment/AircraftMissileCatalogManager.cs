@@ -140,11 +140,6 @@ namespace MDSFramework.Deployment
             }
         }
 
-        private static void OnPackageRegistered(ContractorPackage _)
-        {
-            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
-        }
-
         private static int RegisterAircraftMountsForMissileLocked(
             Encyclopedia enc,
             ContractorPackage pkg,
@@ -288,6 +283,10 @@ namespace MDSFramework.Deployment
             clonedInfo.muzzleVelocity = spec.TargetMach > 0f ? spec.TargetMach * 340.3f : Mathf.Max(280f, spec.CruiseSpeedMps);
             clonedInfo.maxSpeed = clonedInfo.muzzleVelocity;
             clonedInfo.blastDamage = Mathf.Max(10f, spec.BlastYield);
+            if (spec.IsAntiShip)
+            {
+                clonedInfo.pK = Mathf.Max(clonedInfo.pK, Mathf.Clamp(clonedInfo.blastDamage / 25f, 0.75f, 8.0f));
+            }
 
             TargetRequirements tr = clonedInfo.targetRequirements;
             tr.maxRange = Mathf.Max(10000f, spec.MaxEngagementRangeKm * 1000f);

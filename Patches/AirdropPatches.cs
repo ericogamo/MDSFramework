@@ -293,14 +293,20 @@ namespace MDSFramework.Patches
             if (!GameInteropHelpers.IsServerAuthority() ||
                 __result is not Container container ||
                 unit == null ||
-                container.disabled ||
-                (owner != null && owner.disabled))
+                container.disabled)
             {
                 return;
             }
 
             if (!AirdropCatalogManager.TryResolveCargoDef(unit, out AirdropCatalogEntry entry))
             {
+                return;
+            }
+
+            if (owner != null && owner.disabled)
+            {
+                MdsLog.Warn($"[Airdrop] Carrier disabled before cargo spawn for '{entry.Spec.UnitId}'; rejecting container.");
+                CapRejectedContainerCleaner.RejectAndDestroy(container);
                 return;
             }
 
@@ -319,23 +325,16 @@ namespace MDSFramework.Patches
                                    entry.Spec.Logistics.CapWeight);
             if (!consumedCap)
             {
+                float refunded = 0f;
                 float refund = entry.Spec.Logistics != null ? Mathf.Max(0f, entry.Spec.Logistics.CreditCost) : 0f;
-                if (refund > 0f)
+                if (refund > 0f && owner is Aircraft ac && ac.Player != null)
                 {
-                    if (owner is Aircraft ac && ac.Player != null)
-                    {
-                        ac.Player.AddAllocation(refund);
-                    }
-                    else
-                    {
-                        RtsBridgeHost.Current.Economy.TrySpendFactionCredits(
-                            faction,
-                            -refund,
-                            $"Refund {entry.Spec.DisplayName} (Unit Cap Full)");
-                    }
+                    // Only player aircraft paid out of Player.Allocation; AI aircraft do not pay faction credits for airdrops.
+                    ac.Player.AddAllocation(refund);
+                    refunded = refund;
                 }
 
-                MdsLog.Warn($"[Airdrop] Unit cap full for '{entry.Spec.UnitId}' ({faction}); rejecting & removing container (refunded {refund:0}).");
+                MdsLog.Warn($"[Airdrop] Unit cap full for '{entry.Spec.UnitId}' ({faction}); rejecting & removing container (refunded {refunded:0}).");
                 CapRejectedContainerCleaner.RejectAndDestroy(container);
                 return;
             }
@@ -384,6 +383,12 @@ namespace MDSFramework.Patches
                 }
             }
 
+            if (container.rb != null)
+            {
+                container.rb.detectCollisions = false;
+                container.rb.isKinematic = true;
+            }
+
             if (container.GetComponent<CapRejectedContainerCleaner>() == null)
             {
                 CapRejectedContainerCleaner cleaner = container.gameObject.AddComponent<CapRejectedContainerCleaner>();
@@ -419,6 +424,20 @@ namespace MDSFramework.Patches
         }
     }
 
+    [HarmonyPatch(typeof(MountedCargo), "PushCargoOut", new[] { typeof(Rigidbody) })]
+    internal static class MountedCargoPushCargoOutRejectedGuardPatch
+    {
+        private static bool Prefix(Rigidbody cargoRB)
+        {
+            if (cargoRB == null || cargoRB.GetComponent<CapRejectedContainerCleaner>() != null)
+            {
+                return false;
+            }
+
+            return true;
+        }
+    }
+
     [HarmonyPatch(typeof(WeaponChecker), nameof(WeaponChecker.MountAllowedHQ), new[] { typeof(WeaponMount), typeof(FactionHQ) })]
     internal static class WeaponCheckerAirdropFilterPatch
     {
@@ -447,17 +466,19 @@ namespace MDSFramework.Patches
                 return;
             }
 
-            int tier = RtsBridgeHost.Current.Economy.QueryFactionTechTier(faction);
-            if (tier < entry.Spec.Logistics.RequiredTechTier)
+            if (entry.Spec.Logistics != null)
             {
-                __result = false;
-                return;
-            }
+                int tier = RtsBridgeHost.Current.Economy.QueryFactionTechTier(faction);
+                if (tier < entry.Spec.Logistics.RequiredTechTier)
+                {
+                    __result = false;
+                    return;
+                }
 
-            if (entry.Spec.Logistics != null &&
-                !RtsBridgeHost.Current.Caps.CanConsumeCap(faction, entry.Spec.Logistics.CapCategory, entry.Spec.Logistics.CapWeight, out _))
-            {
-                __result = false;
+                if (!RtsBridgeHost.Current.Caps.CanConsumeCap(faction, entry.Spec.Logistics.CapCategory, entry.Spec.Logistics.CapWeight, out _))
+                {
+                    __result = false;
+                }
             }
         }
     }

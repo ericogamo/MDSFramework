@@ -8,7 +8,7 @@ namespace MDSFramework.Patches
     {
         private static void Postfix(BallisticMissileGuidance __instance)
         {
-            if (!MdsConfig.EnableAbmEarlyWarning.Value || __instance == null)
+            if (!GameInteropHelpers.IsServerAuthority() || !MdsConfig.EnableAbmEarlyWarning.Value || __instance == null)
             {
                 return;
             }

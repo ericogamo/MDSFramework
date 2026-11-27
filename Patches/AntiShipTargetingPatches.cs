@@ -14,6 +14,32 @@ namespace MDSFramework.Patches
             return target != null && !target.disabled && target is Ship;
         }
 
+        internal static bool IsRemoteClientOnServer(Unit? owner)
+        {
+            return owner != null &&
+                   owner.IsServer &&
+                   !owner.HasAuthority &&
+                   GameManager.gameState == GameState.Multiplayer;
+        }
+
+        internal static bool IsTargetAllowedForLaunch(Unit? owner, Unit? target)
+        {
+            if (owner != null &&
+                !owner.IsServer &&
+                !owner.HasAuthority &&
+                GameManager.gameState != GameState.SinglePlayer)
+            {
+                return true;
+            }
+
+            if (IsRemoteClientOnServer(owner))
+            {
+                return target is Ship;
+            }
+
+            return IsValidAntiShipTarget(target);
+        }
+
         internal static void ReportShipsOnlyIfLocalPlayer(Unit? owner, string? weaponName)
         {
             if (owner == null ||
@@ -113,15 +139,7 @@ namespace MDSFramework.Patches
                 return true;
             }
 
-            if (owner != null &&
-                !owner.IsServer &&
-                !owner.HasAuthority &&
-                GameManager.gameState != GameState.SinglePlayer)
-            {
-                return true;
-            }
-
-            if (AntiShipTargetingPatches.IsValidAntiShipTarget(target))
+            if (AntiShipTargetingPatches.IsTargetAllowedForLaunch(owner, target))
             {
                 return true;
             }
@@ -149,15 +167,7 @@ namespace MDSFramework.Patches
                 return true;
             }
 
-            if (owner != null &&
-                !owner.IsServer &&
-                !owner.HasAuthority &&
-                GameManager.gameState != GameState.SinglePlayer)
-            {
-                return true;
-            }
-
-            return AntiShipTargetingPatches.IsValidAntiShipTarget(target);
+            return AntiShipTargetingPatches.IsTargetAllowedForLaunch(owner, target);
         }
     }
 

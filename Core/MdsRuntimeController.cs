@@ -22,6 +22,7 @@ namespace MDSFramework
         private SmartEngagementEngine wtaEngine = null!;
         private ModularSiteManager siteManager = null!;
         private float nextAirdropRetryTime;
+        private int lastAirdropCheckPackageCount = -1;
 
         private void Awake()
         {
@@ -45,15 +46,20 @@ namespace MDSFramework
         {
             float dt = Time.deltaTime;
 
+            int packageCount = ContractorRegistry.GetPackages().Count;
             if (Encyclopedia.i != null &&
-                ContractorRegistry.GetPackages().Count > 0 &&
-                (MdsEncyclopediaCatalog.RegisteredUnitCount == 0 ||
-                 (!AirdropCatalogManager.NoTemplateAvailable && (AirdropCatalogManager.RegisteredMountCount == 0 || AirdropCatalogManager.InjectedAircraftCount == 0))))
+                packageCount > 0 &&
+                Time.unscaledTime >= nextAirdropRetryTime)
             {
-                if (!AirdropCatalogManager.NoTemplateAvailable || Time.unscaledTime >= nextAirdropRetryTime)
+                bool needsUnitRegistration = MdsEncyclopediaCatalog.RegisteredUnitCount == 0;
+                bool needsAirdropRegistration = !AirdropCatalogManager.NoTemplateAvailable &&
+                    ((AirdropCatalogManager.RegisteredMountCount == 0 && lastAirdropCheckPackageCount != packageCount) ||
+                     (AirdropCatalogManager.RegisteredMountCount > 0 && AirdropCatalogManager.InjectedAircraftCount == 0));
+                if (needsUnitRegistration || needsAirdropRegistration)
                 {
                     nextAirdropRetryTime = Time.unscaledTime + 1.0f;
                     MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
+                    lastAirdropCheckPackageCount = packageCount;
                 }
             }
 
@@ -75,6 +81,16 @@ namespace MDSFramework
             abmWarning.Tick();
             wtaEngine.Tick(Time.time);
             AheadAirburstManager.Tick(dt);
+        }
+
+        private void FixedUpdate()
+        {
+            if (!GameInteropHelpers.IsGameplayActive())
+            {
+                return;
+            }
+
+            AheadAirburstManager.FixedTick(Time.fixedDeltaTime);
         }
 
         private void OnGUI()
@@ -118,7 +134,7 @@ namespace MDSFramework
             IsResettingScene = true;
             try
             {
-                ResetSessionStateCore(clearHeavyCaches: false);
+                ResetSessionStateCore(clearHeavyCaches: false, preserveActiveServerConnection: false);
                 MdsLog.Debug("MDS session reset on network disconnect/stop.");
             }
             finally
@@ -132,7 +148,12 @@ namespace MDSFramework
             IsResettingScene = true;
             try
             {
-                ResetSessionStateCore(clearHeavyCaches: next.name.IndexOf("Menu", StringComparison.OrdinalIgnoreCase) >= 0);
+                bool isMenuScene =
+                    next.name.IndexOf("Menu", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    string.Equals(next.name, "empty", StringComparison.OrdinalIgnoreCase) ||
+                    next.name.IndexOf("Waiting", StringComparison.OrdinalIgnoreCase) >= 0;
+                bool preserveServer = !isMenuScene && GameInteropHelpers.IsServerAuthority();
+                ResetSessionStateCore(clearHeavyCaches: isMenuScene, preserveActiveServerConnection: preserveServer);
                 MdsLog.Debug($"MDS session reset on scene change -> {next.name}");
             }
             finally
@@ -141,7 +162,7 @@ namespace MDSFramework
             }
         }
 
-        private void ResetSessionStateCore(bool clearHeavyCaches)
+        private void ResetSessionStateCore(bool clearHeavyCaches, bool preserveActiveServerConnection)
         {
             wtaEngine.ResetSession();
             abmWarning.ResetSession();
@@ -152,7 +173,7 @@ namespace MDSFramework
             AheadAirburstManager.ResetSession();
             MdsDestructionManager.ResetSession();
             VanillaBridgeFallbacks.ResetSession();
-            MdsNetworkSync.ResetSession();
+            MdsNetworkSync.ResetSession(preserveActiveServerConnection);
             PendingMdsSpawnScope.Clear();
             AirMissileLaunchTracker.Clear();
             CustomMissileWarningAudioLookup.ResetSession();

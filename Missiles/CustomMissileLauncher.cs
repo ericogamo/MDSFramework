@@ -35,13 +35,35 @@ namespace MDSFramework.Missiles
             }
 
             bool hasUnitRadar = launcherUnit.radar != null;
-            MissileDefinition? baseDef = (!hasUnitRadar && !missileSpec.IsAntiShip && !missileSpec.IsAntiVehicle)
-                ? GameInteropHelpers.ResolveEncyclopediaArhMissileDef(missileSpec.BaseMissileCloneKey)
-                : GameInteropHelpers.ResolveEncyclopediaMissileDef(
+            bool requiresArhSeeker = missileSpec.SupportsActiveToPassiveHoj ||
+                                     missileSpec.RequiresTargetEcmToTrack ||
+                                     missileSpec.IsAbmInterceptor ||
+                                     !hasUnitRadar;
+
+            MissileDefinition? baseDef = null;
+            if (!missileSpec.IsAntiShip && !missileSpec.IsAntiVehicle)
+            {
+                if (!requiresArhSeeker && !string.IsNullOrWhiteSpace(missileSpec.BaseMissileCloneKey))
+                {
+                    MissileDefinition? requestedDef = GameInteropHelpers.ResolveEncyclopediaMissileDef(
+                        missileSpec.BaseMissileCloneKey,
+                        preferBallisticOrSam: missileSpec.MaxEngagementRangeKm >= 20f);
+                    if (requestedDef != null &&
+                        requestedDef.unitPrefab != null &&
+                        requestedDef.unitPrefab.GetComponent<SARHSeeker>() != null)
+                    {
+                        baseDef = requestedDef;
+                    }
+                }
+
+                baseDef ??= GameInteropHelpers.ResolveEncyclopediaArhMissileDef(missileSpec.BaseMissileCloneKey);
+            }
+            else
+            {
+                baseDef = GameInteropHelpers.ResolveEncyclopediaMissileDef(
                     missileSpec.BaseMissileCloneKey,
-                    preferBallisticOrSam: !missileSpec.IsAntiShip &&
-                        !missileSpec.IsAntiVehicle &&
-                        (missileSpec.IsAbmInterceptor || missileSpec.MaxEngagementRangeKm >= 20f));
+                    preferBallisticOrSam: false);
+            }
 
             if (baseDef == null || baseDef.unitPrefab == null)
             {

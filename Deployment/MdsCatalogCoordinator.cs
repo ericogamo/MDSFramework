@@ -14,6 +14,8 @@ namespace MDSFramework.Deployment
     {
         private static readonly object CoordinatorLock = new object();
         private static bool initialized;
+        private static Encyclopedia? lastCanonicalEncyclopedia;
+        private static bool canonicalRegistrationCompleted;
 
         internal static uint CatalogWireHash { get; private set; }
         internal static int MdsIndexEntryCount { get; private set; }
@@ -38,11 +40,26 @@ namespace MDSFramework.Deployment
             }
 
             initialized = false;
+            lastCanonicalEncyclopedia = null;
+            canonicalRegistrationCompleted = false;
             ContractorRegistry.OnPackageRegistered -= OnPackageRegistered;
         }
 
-        private static void OnPackageRegistered(ContractorPackage _)
+        private static void OnPackageRegistered(ContractorPackage pkg)
         {
+            Encyclopedia? enc = Encyclopedia.i;
+            if (enc != null &&
+                ReferenceEquals(enc, lastCanonicalEncyclopedia) &&
+                canonicalRegistrationCompleted &&
+                enc.IndexLookup != null &&
+                enc.IndexLookup.Count > 0)
+            {
+                MdsLog.Warn(
+                    $"[Catalog] Rejecting late RegisterPackage('{pkg?.PackageId}') after Encyclopedia.AfterLoad populated IndexLookup ({enc.IndexLookup.Count} entries). " +
+                    "Contractor packages must register during Awake() to prevent Mirage IndexLookup desync.");
+                return;
+            }
+
             EnsureAllRegisteredCanonical();
         }
 
@@ -56,6 +73,12 @@ namespace MDSFramework.Deployment
 
             lock (CoordinatorLock)
             {
+                if (!ReferenceEquals(lastCanonicalEncyclopedia, enc))
+                {
+                    lastCanonicalEncyclopedia = enc;
+                    canonicalRegistrationCompleted = false;
+                }
+
                 int addedUnitsOrMissiles = MdsEncyclopediaCatalog.EnsureRegisteredAllInternal(enc);
                 int addedAirdrop = AirdropCatalogManager.EnsureRegisteredAllInternal(enc);
                 int addedAirMissiles = AircraftMissileCatalogManager.EnsureRegisteredAllInternal(enc);
@@ -63,6 +86,11 @@ namespace MDSFramework.Deployment
                 if (addedUnitsOrMissiles > 0 || addedAirdrop > 0 || addedAirMissiles > 0)
                 {
                     MdsEncyclopediaCatalog.InvalidateMissionEditorCache();
+                }
+
+                if (enc.IndexLookup != null && enc.IndexLookup.Count > 0)
+                {
+                    canonicalRegistrationCompleted = true;
                 }
 
                 RecomputeWireHash(enc);

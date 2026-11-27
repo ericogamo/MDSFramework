@@ -117,6 +117,29 @@ internal static class GameInteropHelpers
         return state == GameState.SinglePlayer || state == GameState.Multiplayer;
     }
 
+    internal static bool IsGameplaySceneReady()
+    {
+        if (!IsGameplayActive() || NetworkManagerNuclearOption.IsLoadingScene)
+        {
+            return false;
+        }
+
+        if (NetworkSceneSingleton<LevelInfo>.i == null)
+        {
+            return false;
+        }
+
+        string sceneName = UnityEngine.SceneManagement.SceneManager.GetActiveScene().name ?? string.Empty;
+        if (sceneName.IndexOf("Menu", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            string.Equals(sceneName, "empty", StringComparison.OrdinalIgnoreCase) ||
+            sceneName.IndexOf("Waiting", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     internal static bool IsServerAuthority()
     {
         if (GameManager.gameState == GameState.SinglePlayer)
@@ -213,7 +236,7 @@ internal static class GameInteropHelpers
             MdsLog.Debug($"FactionRegistry lookup failed: {ex.Message}");
         }
 
-        if (GameManager.GetLocalHQ(out FactionHQ fallbackHq))
+        if (affinity == FactionAffinity.Any && GameManager.GetLocalHQ(out FactionHQ fallbackHq))
         {
             return fallbackHq;
         }
@@ -710,15 +733,19 @@ internal static class GameInteropHelpers
         if (aircraft.partDamageTracker != null)
         {
             float detached = aircraft.partDamageTracker.GetDetachedRatio();
-            bool isAi = aircraft.Player == null;
-            if (isAi && aircraft.radarAlt > 40f && detached > 0.12f)
+            if (detached >= 0.35f)
             {
                 return true;
             }
 
-            if (detached >= 0.35f)
+            bool isAi = aircraft.Player == null;
+            if (isAi && aircraft.radarAlt > 40f && detached >= 0.25f)
             {
-                return true;
+                Rigidbody? rb = aircraft.rb;
+                if (rb != null && (rb.velocity.y < -25f || rb.angularVelocity.sqrMagnitude > 4f))
+                {
+                    return true;
+                }
             }
         }
 

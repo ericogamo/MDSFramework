@@ -69,7 +69,6 @@ namespace MDSFramework.Wta
         private static readonly List<AheadProjectile> Projectiles = new List<AheadProjectile>(MaxActiveProjectiles);
         private static readonly List<AheadBurstFlash> Flashes = new List<AheadBurstFlash>(MaxActiveFlashes);
         private static readonly List<PendingShotAudio> PendingAudioShots = new List<PendingShotAudio>(32);
-        private static readonly List<Missile> PreDisarmedScratch = new List<Missile>(8);
         private static readonly Dictionary<int, ClientGunAudioState> ClientAudioByInstanceId = new Dictionary<int, ClientGunAudioState>();
 
         private static Material? tracerMaterial;
@@ -82,7 +81,8 @@ namespace MDSFramework.Wta
             Vector3 targetPos,
             Vector3 targetVel,
             bool isNuclear,
-            float targetAltMeters)
+            float targetAltMeters,
+            int burstRounds = 2)
         {
             if (site == null || site.Unit == null || target == null)
             {
@@ -92,6 +92,8 @@ namespace MDSFramework.Wta
             _ = isNuclear;
             _ = targetAltMeters;
 
+            int rounds = Mathf.Clamp(burstRounds, 1, 2);
+            bool headless = GameManager.IsHeadless;
             float muzzleVel = Mathf.Max(600f, site.Spec.GunMuzzleVelocityMps);
 
             // Two-pass ballistic intercept with gravity drop compensation.
@@ -112,7 +114,8 @@ namespace MDSFramework.Wta
             float burstDmg = Mathf.Max(15f, site.Spec.GunDamagePerBurst);
 
             string? shellGlbPath = null;
-            if (MdsConfig.EnableCustomGlbVisuals.Value &&
+            if (!headless &&
+                MdsConfig.EnableCustomGlbVisuals.Value &&
                 site.Package != null &&
                 !string.IsNullOrWhiteSpace(site.Spec.GunProjectileGlbRelativePath))
             {
@@ -129,7 +132,7 @@ namespace MDSFramework.Wta
             float shellScale = Mathf.Clamp(site.Spec.GunProjectileVisualScale, 0.5f, 25f);
             string shellCacheKey = $"ahead_shell_{site.Spec.UnitId}";
 
-            for (int shot = 0; shot < 2; shot++)
+            for (int shot = 0; shot < rounds; shot++)
             {
                 if (Projectiles.Count >= MaxActiveProjectiles)
                 {
@@ -142,32 +145,37 @@ namespace MDSFramework.Wta
                 Vector3 spawnPos = muzzlePos + (shotDir * (shot * 6f));
                 float fuseOffset = shot * 0.014f;
 
-                CreateTracerVisual(spawnPos, shotDir, out GameObject visualGo, out LineRenderer line);
+                GameObject? visualGo = null;
+                LineRenderer? line = null;
                 GameObject? shellVisualGo = null;
                 GlbKeyframedAnimator? shellAnimator = null;
-                if (!string.IsNullOrEmpty(shellGlbPath))
+                if (!headless)
                 {
-                    var shellParent = new GameObject("MDS_AheadShell3D");
-                    shellParent.transform.position = spawnPos;
-                    shellParent.transform.rotation = Quaternion.LookRotation(shotDir);
-                    shellParent.transform.localScale = Vector3.one * shellScale;
-                    GlbInstantiatedRig? shellRig = GlbRuntimeLoader.Instantiate(
-                        shellCacheKey,
-                        shellGlbPath,
-                        "projectile",
-                        null,
-                        shellParent.transform,
-                        180f);
-                    if (shellRig != null)
+                    CreateTracerVisual(spawnPos, shotDir, out visualGo, out line);
+                    if (!string.IsNullOrEmpty(shellGlbPath))
                     {
-                        shellAnimator = shellRig.RootObject.GetComponent<GlbKeyframedAnimator>()
-                            ?? shellRig.RootObject.AddComponent<GlbKeyframedAnimator>();
-                        shellAnimator.Initialize(shellRig, 0.26f, startDeployed: false);
-                        shellVisualGo = shellParent;
-                    }
-                    else
-                    {
-                        UnityEngine.Object.Destroy(shellParent);
+                        var shellParent = new GameObject("MDS_AheadShell3D");
+                        shellParent.transform.position = spawnPos;
+                        shellParent.transform.rotation = Quaternion.LookRotation(shotDir);
+                        shellParent.transform.localScale = Vector3.one * shellScale;
+                        GlbInstantiatedRig? shellRig = GlbRuntimeLoader.Instantiate(
+                            shellCacheKey,
+                            shellGlbPath,
+                            "projectile",
+                            null,
+                            shellParent.transform,
+                            180f);
+                        if (shellRig != null)
+                        {
+                            shellAnimator = shellRig.RootObject.GetComponent<GlbKeyframedAnimator>()
+                                ?? shellRig.RootObject.AddComponent<GlbKeyframedAnimator>();
+                            shellAnimator.Initialize(shellRig, 0.26f, startDeployed: false);
+                            shellVisualGo = shellParent;
+                        }
+                        else
+                        {
+                            UnityEngine.Object.Destroy(shellParent);
+                        }
                     }
                 }
 
@@ -182,7 +190,7 @@ namespace MDSFramework.Wta
                     Velocity = shotDir * muzzleVel,
                     Elapsed = 0f,
                     ProgrammedFuseSeconds = Mathf.Max(0.025f, baseFuseSeconds + fuseOffset),
-                    DamagePerBurst = burstDmg * 0.6f,
+                    DamagePerBurst = burstDmg * 0.5f,
                     CanEngageGroundVehicles = site.Spec.CanEngageGroundVehicles,
                     IsAuthoritative = true,
                     VisualGo = visualGo,
@@ -194,7 +202,10 @@ namespace MDSFramework.Wta
             }
 
             MdsNetworkSync.BroadcastAheadBurst(site, muzzlePos, baseDir, muzzleVel, baseFuseSeconds);
-            TriggerBurstAudio(site, 2);
+            if (!headless)
+            {
+                TriggerBurstAudio(site, rounds);
+            }
         }
 
         internal static void SpawnClientVisualBurst(
@@ -206,6 +217,10 @@ namespace MDSFramework.Wta
             float muzzleVel,
             float baseFuseSeconds)
         {
+            if (GameManager.IsHeadless)
+            {
+                return;
+            }
             string? shellGlbPath = null;
             if (MdsConfig.EnableCustomGlbVisuals.Value &&
                 pkg != null &&
@@ -292,21 +307,31 @@ namespace MDSFramework.Wta
 
         internal static void Tick(float deltaTime)
         {
-            if (deltaTime <= 0f)
+            if (deltaTime <= 0f || GameManager.IsHeadless)
             {
                 return;
             }
 
             TickPendingAudioShots(deltaTime);
             TickFlashes(deltaTime);
+        }
 
+        internal static void FixedTick(float fixedDeltaTime)
+        {
+            if (fixedDeltaTime <= 0f)
+            {
+                return;
+            }
+
+            bool headless = GameManager.IsHeadless;
             for (int i = Projectiles.Count - 1; i >= 0; i--)
             {
                 AheadProjectile proj = Projectiles[i];
                 Vector3 prevPos = proj.Position;
-                proj.Velocity += Vector3.down * (9.81f * deltaTime);
-                Vector3 nextPos = prevPos + (proj.Velocity * deltaTime);
-                proj.Elapsed += deltaTime;
+                proj.Velocity += Vector3.down * (9.81f * fixedDeltaTime);
+                Vector3 nextPos = prevPos + (proj.Velocity * fixedDeltaTime);
+                float prevElapsed = proj.Elapsed;
+                proj.Elapsed += fixedDeltaTime;
 
                 if (Physics.Linecast(prevPos, nextPos, out RaycastHit hit, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                 {
@@ -323,20 +348,39 @@ namespace MDSFramework.Wta
                 }
 
                 bool fuseReached = proj.Elapsed >= proj.ProgrammedFuseSeconds;
+                float fuseFrac = fuseReached
+                    ? Mathf.Clamp01((proj.ProgrammedFuseSeconds - prevElapsed) / fixedDeltaTime)
+                    : 1f;
+                Vector3 fusePos = fuseReached ? Vector3.Lerp(prevPos, nextPos, fuseFrac) : nextPos;
+
                 bool proximityPassed = false;
-                if (!fuseReached && proj.Target != null && !proj.Target.disabled)
+                float proxFrac = 1f;
+                Vector3 proxPos = nextPos;
+                if (proj.Target != null && !proj.Target.disabled)
                 {
-                    Vector3 toTarget = SmartEngagementEngine.GetTargetAimPosition(proj.Target) - nextPos;
+                    Vector3 targetAimPos = SmartEngagementEngine.GetTargetAimPosition(proj.Target);
                     float proxRadius = proj.Target is GroundVehicle ? 18f : 55f;
-                    if (toTarget.sqrMagnitude <= proxRadius * proxRadius && Vector3.Dot(proj.Velocity, toTarget) <= 0f)
+                    Vector3 seg = nextPos - prevPos;
+                    float segLenSq = seg.sqrMagnitude;
+                    float tClosest = segLenSq > 0.0001f
+                        ? Mathf.Clamp01(Vector3.Dot(targetAimPos - prevPos, seg) / segLenSq)
+                        : 0f;
+                    Vector3 closestPt = prevPos + (seg * tClosest);
+                    if ((targetAimPos - closestPt).sqrMagnitude <= proxRadius * proxRadius &&
+                        (tClosest < 1f || Vector3.Dot(proj.Velocity, targetAimPos - nextPos) <= 0f))
                     {
                         proximityPassed = true;
+                        proxFrac = tClosest;
+                        proxPos = closestPt;
                     }
                 }
 
                 if (fuseReached || proximityPassed)
                 {
-                    DetonateAheadCone(proj, nextPos);
+                    Vector3 burstPos = (proximityPassed && (!fuseReached || proxFrac <= fuseFrac))
+                        ? proxPos
+                        : fusePos;
+                    DetonateAheadCone(proj, burstPos);
                     DestroyProjectileVisual(proj);
                     Projectiles.RemoveAt(i);
                     continue;
@@ -350,15 +394,18 @@ namespace MDSFramework.Wta
                 }
 
                 proj.Position = nextPos;
-                if (proj.ShellVisualGo != null)
+                if (!headless)
                 {
-                    proj.SpinDeg = (proj.SpinDeg + (2400f * deltaTime)) % 360f;
-                    Vector3 dir = proj.Velocity.sqrMagnitude > 0.01f ? proj.Velocity.normalized : Vector3.forward;
-                    proj.ShellVisualGo.transform.position = nextPos;
-                    proj.ShellVisualGo.transform.rotation = Quaternion.LookRotation(dir) * Quaternion.Euler(0f, 0f, proj.SpinDeg);
-                }
+                    if (proj.ShellVisualGo != null)
+                    {
+                        proj.SpinDeg = (proj.SpinDeg + (2400f * fixedDeltaTime)) % 360f;
+                        Vector3 dir = proj.Velocity.sqrMagnitude > 0.01f ? proj.Velocity.normalized : Vector3.forward;
+                        proj.ShellVisualGo.transform.position = nextPos;
+                        proj.ShellVisualGo.transform.rotation = Quaternion.LookRotation(dir) * Quaternion.Euler(0f, 0f, proj.SpinDeg);
+                    }
 
-                UpdateTracerVisual(proj);
+                    UpdateTracerVisual(proj);
+                }
             }
         }
 
@@ -386,7 +433,6 @@ namespace MDSFramework.Wta
 
             Flashes.Clear();
             PendingAudioShots.Clear();
-            PreDisarmedScratch.Clear();
             ClientAudioByInstanceId.Clear();
         }
 
@@ -414,65 +460,42 @@ namespace MDSFramework.Wta
             GlbKeyframedAnimator? shellAnim = proj.ShellAnimator;
             proj.ShellVisualGo = null;
             proj.ShellAnimator = null;
-            SpawnAirburstVisual(burstPos, forward, shellGo, shellAnim, proj.SpinDeg);
+            if (!GameManager.IsHeadless)
+            {
+                SpawnAirburstVisual(burstPos, forward, shellGo, shellAnim, proj.SpinDeg);
+            }
+            else if (shellGo != null)
+            {
+                UnityEngine.Object.Destroy(shellGo);
+            }
 
             if (!proj.IsAuthoritative || !GameInteropHelpers.IsServerAuthority())
             {
                 return;
             }
 
-            PreDisarmedScratch.Clear();
-            if (MdsConfig.EnableHighAltitudeDisarm.Value && UnitRegistry.allUnits != null)
-            {
-                float threshold = MdsConfig.AbmBlastYieldThreshold.Value;
-                for (int i = 0; i < UnitRegistry.allUnits.Count; i++)
-                {
-                    if (UnitRegistry.allUnits[i] is Missile m &&
-                        !m.disabled &&
-                        (m.transform.position.y - Datum.LocalSeaY) >= 800f &&
-                        (m.transform.position - burstPos).sqrMagnitude <= 55f * 55f &&
-                        GameInteropHelpers.SafeGetBlastYield(m) >= threshold &&
-                        m.IsArmed() &&
-                        GameInteropHelpers.SafeDisarmWarhead(m))
-                    {
-                        PreDisarmedScratch.Add(m);
-                    }
-                }
-            }
-
-            PersistentID dealerId = proj.OwnerUnit != null ? proj.OwnerUnit.persistentID : PersistentID.None;
-            try
-            {
-                DamageEffects.BlastFrag(1.5f, burstPos, dealerId, PersistentID.None);
-            }
-            catch (Exception ex)
-            {
-                MdsLog.Debug($"Ahead BlastFrag skipped: {ex.Message}");
-            }
-
-            for (int i = 0; i < PreDisarmedScratch.Count; i++)
-            {
-                Missile m = PreDisarmedScratch[i];
-                if (m != null && !m.disabled)
-                {
-                    m.Arm();
-                }
-            }
-
-            PreDisarmedScratch.Clear();
-
             bool hitPrimary = false;
-            if (proj.Target != null && !proj.Target.disabled)
+            if (proj.Target != null &&
+                !proj.Target.disabled &&
+                GameInteropHelpers.IsHostileToAffinity(proj.Target, proj.OwnerFaction, proj.OwnerHq))
             {
-                Vector3 toPrimary = SmartEngagementEngine.GetTargetAimPosition(proj.Target) - burstPos;
-                float dist = toPrimary.magnitude;
-                bool inRange = dist <= 50f;
-                bool inCone = dist <= 28f || (dist > 0.01f && Vector3.Dot(forward, toPrimary / dist) >= 0.90f);
-                if (inRange && inCone)
+                bool isGroundPrimary = proj.Target is GroundVehicle;
+                if (proj.Target is Missile || proj.Target is Aircraft || (proj.CanEngageGroundVehicles && isGroundPrimary))
                 {
-                    float scale = Mathf.Clamp(1.05f - (dist / 95f), 0.60f, 1.0f);
-                    ApplyAheadDamageWithDisarm(proj.OwnerUnit, proj.Target, proj.DamagePerBurst * scale);
-                    hitPrimary = true;
+                    Vector3 toPrimary = SmartEngagementEngine.GetTargetAimPosition(proj.Target) - burstPos;
+                    float dist = toPrimary.magnitude;
+                    bool inRange = dist <= (isGroundPrimary ? 24f : 50f);
+                    bool inCone = isGroundPrimary
+                        ? (dist <= 12f || (dist > 0.01f && Vector3.Dot(forward, toPrimary / dist) >= 0.92f))
+                        : (dist <= 28f || (dist > 0.01f && Vector3.Dot(forward, toPrimary / dist) >= 0.90f));
+                    if (inRange && inCone)
+                    {
+                        float scale = isGroundPrimary
+                            ? Mathf.Clamp(0.90f - (dist / 45f), 0.45f, 0.85f)
+                            : Mathf.Clamp(1.05f - (dist / 95f), 0.60f, 1.0f);
+                        ApplyAheadDamageWithDisarm(proj.OwnerUnit, proj.Target, proj.DamagePerBurst * scale);
+                        hitPrimary = true;
+                    }
                 }
             }
 
@@ -512,7 +535,17 @@ namespace MDSFramework.Wta
                     continue;
                 }
 
-                float scale = Mathf.Clamp(1.0f - (dist / 85f), 0.55f, 1.0f);
+                float scale;
+                if (isGroundCand)
+                {
+                    float armorPenalty = cand.definition != null && cand.definition.value >= 30f ? 0.65f : 1.0f;
+                    scale = Mathf.Clamp((1.0f - (dist / 28f)) * 0.50f * armorPenalty, 0.15f, 0.45f);
+                }
+                else
+                {
+                    scale = Mathf.Clamp(0.85f - (dist / 85f), 0.40f, 0.80f);
+                }
+
                 ApplyAheadDamageWithDisarm(proj.OwnerUnit, cand, proj.DamagePerBurst * scale);
             }
         }
@@ -525,16 +558,17 @@ namespace MDSFramework.Wta
             }
 
             bool temporarilyDisarmed = false;
-            if (target is Missile m &&
-                MdsConfig.EnableHighAltitudeDisarm.Value &&
-                (m.transform.position.y - Datum.LocalSeaY) >= 800f &&
-                GameInteropHelpers.SafeGetBlastYield(m) >= MdsConfig.AbmBlastYieldThreshold.Value &&
-                m.IsArmed())
+            if (target is Missile m && m.IsArmed())
             {
-                temporarilyDisarmed = GameInteropHelpers.SafeDisarmWarhead(m);
+                bool shouldDisarm = MdsConfig.EnableHighAltitudeDisarm.Value ||
+                                    GameInteropHelpers.SafeGetBlastYield(m) < MdsConfig.AbmBlastYieldThreshold.Value;
+                if (shouldDisarm)
+                {
+                    temporarilyDisarmed = GameInteropHelpers.SafeDisarmWarhead(m);
+                }
             }
 
-            SmartEngagementEngine.ApplyThermalOrKineticDamage(attacker!, target, damage, isFire: false);
+            SmartEngagementEngine.ApplyThermalOrKineticDamage(attacker, target, damage, isFire: false);
 
             if (temporarilyDisarmed && target is Missile mAfter && !mAfter.disabled)
             {

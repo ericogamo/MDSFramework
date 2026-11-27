@@ -145,7 +145,7 @@ namespace MDSFramework.Deployment
             unit = targetUnit;
             package = pkg;
             spec = unitSpec;
-            MdsDestructionManager.SuppressVanillaWreckage(targetUnit);
+            MdsDestructionManager.SuppressVanillaWreckage(targetUnit, pkg, unitSpec);
 
             targetUnit.onDisableUnit -= HandleDisabled;
             targetUnit.onDisableUnit += HandleDisabled;
@@ -156,9 +156,19 @@ namespace MDSFramework.Deployment
                 b.OnRepair -= HandleRepaired;
                 b.OnRepair += HandleRepaired;
             }
+
+            if (targetUnit.disabled)
+            {
+                HandleDisabledInternal(spawnExplosionFx: false);
+            }
         }
 
         private void HandleDisabled(Unit _)
+        {
+            HandleDisabledInternal(spawnExplosionFx: true);
+        }
+
+        private void HandleDisabledInternal(bool spawnExplosionFx)
         {
             if (wreckSpawned || unit == null || package == null || spec == null || MdsRuntimeController.IsResettingScene)
             {
@@ -177,13 +187,16 @@ namespace MDSFramework.Deployment
                 intactRig.gameObject.SetActive(false);
             }
 
+            MdsDestructionManager.DisableDestroyedUnitCollidersAndRenderers(unit, spec);
+
             Vector3 spawnPos = unit is Building ? unit.startPosition.ToLocalPosition() : unit.transform.position;
             activeWreckRoot = MdsDestructionManager.SpawnDestructionSequence(
                 unit,
                 package,
                 spec,
                 spawnPos,
-                unit.transform.rotation);
+                unit.transform.rotation,
+                spawnExplosionFx);
         }
 
         internal void HandleRepaired()
@@ -195,6 +208,16 @@ namespace MDSFramework.Deployment
             if (unit != null && spec != null)
             {
                 Transform? intactRig = unit.transform.Find($"MDS_Rig_{spec.UnitId}");
+                Collider[] cols = unit.GetComponentsInChildren<Collider>(true);
+                for (int i = 0; i < cols.Length; i++)
+                {
+                    Collider? col = cols[i];
+                    if (col != null && (intactRig == null || !col.transform.IsChildOf(intactRig)))
+                    {
+                        col.enabled = true;
+                    }
+                }
+
                 if (intactRig != null)
                 {
                     intactRig.gameObject.SetActive(true);
@@ -228,8 +251,35 @@ namespace MDSFramework.Deployment
         private static Material? smokeMaterial;
         private static Material? emberMaterial;
 
-        internal static void SuppressVanillaWreckage(Unit? unit)
+        internal static bool HasCustomWreckVisual(ContractorPackage? package, ModularUnitSpec? spec)
         {
+            if (!MdsConfig.EnableCustomGlbVisuals.Value ||
+                package == null ||
+                spec == null ||
+                string.IsNullOrWhiteSpace(spec.DestroyedGlbRelativePath))
+            {
+                return false;
+            }
+
+            string? wreckGlbPath = CustomMissileBehavior.ResolveAssetPath(
+                package,
+                spec.DestroyedGlbRelativePath,
+                Array.Empty<string>());
+            return !string.IsNullOrEmpty(wreckGlbPath) && File.Exists(wreckGlbPath);
+        }
+
+        internal static void SuppressVanillaWreckage(Unit? unit, ContractorPackage? package = null, ModularUnitSpec? spec = null)
+        {
+            if (unit == null)
+            {
+                return;
+            }
+
+            if (package != null && spec != null && !HasCustomWreckVisual(package, spec))
+            {
+                return;
+            }
+
             if (unit is Building building && GameInteropHelpers.BuildingWreckageField != null)
             {
                 GameInteropHelpers.BuildingWreckageField.SetValue(building, null);
@@ -240,30 +290,66 @@ namespace MDSFramework.Deployment
             }
         }
 
+        internal static void DisableDestroyedUnitCollidersAndRenderers(Unit? unit, ModularUnitSpec? spec)
+        {
+            if (unit == null)
+            {
+                return;
+            }
+
+            Transform? rigTf = spec != null ? unit.transform.Find($"MDS_Rig_{spec.UnitId}") : null;
+
+            Collider[] cols = unit.GetComponentsInChildren<Collider>(true);
+            for (int i = 0; i < cols.Length; i++)
+            {
+                Collider? col = cols[i];
+                if (col != null && (rigTf == null || !col.transform.IsChildOf(rigTf)))
+                {
+                    col.enabled = false;
+                }
+            }
+
+            Renderer[] renderers = unit.GetComponentsInChildren<Renderer>(true);
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                Renderer? r = renderers[i];
+                if (r != null &&
+                    !(r is ParticleSystemRenderer) &&
+                    (rigTf == null || !r.transform.IsChildOf(rigTf)))
+                {
+                    r.enabled = false;
+                }
+            }
+
+            Physics.SyncTransforms();
+        }
+
         internal static GameObject? SpawnDestructionSequence(
             Unit unit,
             ContractorPackage package,
             ModularUnitSpec spec,
             Vector3 worldPos,
-            Quaternion worldRot)
+            Quaternion worldRot,
+            bool spawnExplosionFx = true)
         {
             if (unit == null || package == null || spec == null || MdsRuntimeController.IsResettingScene)
             {
                 return null;
             }
 
-            if (!MdsConfig.EnableCustomGlbVisuals.Value || string.IsNullOrWhiteSpace(spec.DestroyedGlbRelativePath))
-            {
-                return null;
-            }
+            DisableDestroyedUnitCollidersAndRenderers(unit, spec);
 
-            string? wreckGlbPath = CustomMissileBehavior.ResolveAssetPath(
-                package,
-                spec.DestroyedGlbRelativePath,
-                Array.Empty<string>());
-            if (string.IsNullOrEmpty(wreckGlbPath) || !File.Exists(wreckGlbPath))
+            string? wreckGlbPath = null;
+            if (MdsConfig.EnableCustomGlbVisuals.Value && !string.IsNullOrWhiteSpace(spec.DestroyedGlbRelativePath))
             {
-                return null;
+                string? resolved = CustomMissileBehavior.ResolveAssetPath(
+                    package,
+                    spec.DestroyedGlbRelativePath,
+                    Array.Empty<string>());
+                if (!string.IsNullOrEmpty(resolved) && File.Exists(resolved))
+                {
+                    wreckGlbPath = resolved;
+                }
             }
 
             while (ActiveWreckRoots.Count >= MaxActiveWrecks)
@@ -276,7 +362,7 @@ namespace MDSFramework.Deployment
                 }
             }
 
-            Vector3 groundedPos = SnapToGround(worldPos, out Vector3 groundNormal);
+            Vector3 groundedPos = SnapToGround(worldPos, unit, out Vector3 groundNormal);
             Transform parentOrigin = Datum.origin != null ? Datum.origin : unit.transform.parent;
 
             var wreckRoot = new GameObject($"MDS_Wreck_{spec.UnitId}");
@@ -288,58 +374,80 @@ namespace MDSFramework.Deployment
             wreckRoot.transform.position = groundedPos;
             wreckRoot.transform.rotation = worldRot;
 
-            GlbInstantiatedRig? wreckRig = GlbRuntimeLoader.Instantiate(
-                $"{spec.UnitId}_wreck",
-                wreckGlbPath,
-                "container",
-                null,
-                wreckRoot.transform,
-                spec.ModelYawOffsetDeg);
-
             GlbKeyframedAnimator? wreckAnimator = null;
             var fireParticles = new List<ParticleSystem>(4);
 
-            if (wreckRig != null && wreckRig.RootObject != null)
+            if (!string.IsNullOrEmpty(wreckGlbPath))
             {
-                if (Mathf.Abs(wreckRig.Bounds.min.y) > 0.01f)
-                {
-                    wreckRig.RootObject.transform.localPosition = new Vector3(0f, -wreckRig.Bounds.min.y, 0f);
-                }
+                GlbInstantiatedRig? wreckRig = GlbRuntimeLoader.Instantiate(
+                    $"{spec.UnitId}_wreck",
+                    wreckGlbPath,
+                    "container",
+                    null,
+                    wreckRoot.transform,
+                    spec.ModelYawOffsetDeg);
 
-                if (wreckRig.DestroyClip != null || wreckRig.DeployClip != null)
+                if (wreckRig != null && wreckRig.RootObject != null)
                 {
-                    wreckAnimator = wreckRig.RootObject.GetComponent<GlbKeyframedAnimator>()
-                        ?? wreckRig.RootObject.AddComponent<GlbKeyframedAnimator>();
-                    wreckAnimator.InitializeOneShot(
-                        wreckRig,
-                        wreckRig.DestroyClip,
-                        Mathf.Max(0.4f, spec.DestroyAnimationDurationSeconds));
-                }
-
-                if (wreckRig.FireOrigins.Count > 0)
-                {
-                    for (int i = 0; i < wreckRig.FireOrigins.Count; i++)
+                    if (Mathf.Abs(wreckRig.Bounds.min.y) > 0.01f)
                     {
-                        Transform origin = wreckRig.FireOrigins[i];
-                        if (origin != null)
+                        wreckRig.RootObject.transform.localPosition = new Vector3(0f, -wreckRig.Bounds.min.y, 0f);
+                    }
+
+                    if (wreckRig.DestroyClip != null || wreckRig.DeployClip != null)
+                    {
+                        wreckAnimator = wreckRig.RootObject.GetComponent<GlbKeyframedAnimator>()
+                            ?? wreckRig.RootObject.AddComponent<GlbKeyframedAnimator>();
+                        wreckAnimator.InitializeOneShot(
+                            wreckRig,
+                            wreckRig.DestroyClip,
+                            Mathf.Max(0.4f, spec.DestroyAnimationDurationSeconds));
+                    }
+
+                    if (wreckRig.FireOrigins.Count > 0)
+                    {
+                        for (int i = 0; i < wreckRig.FireOrigins.Count; i++)
                         {
-                            AddSmolderParticles(origin, fireParticles);
+                            Transform origin = wreckRig.FireOrigins[i];
+                            if (origin != null)
+                            {
+                                AddSmolderParticles(origin, fireParticles);
+                            }
                         }
                     }
-                }
-                else
-                {
-                    AddSmolderParticles(wreckRoot.transform, fireParticles, new Vector3(0f, 0.85f, 0f));
+                    else
+                    {
+                        AddSmolderParticles(wreckRoot.transform, fireParticles, new Vector3(0f, 0.85f, 0f));
+                    }
                 }
             }
+            else if (HasNoVanillaWreckage(unit))
+            {
+                AddSmolderParticles(wreckRoot.transform, fireParticles, new Vector3(0f, 0.85f, 0f));
+            }
 
-            SpawnNativeDestructionFx(groundedPos, groundNormal, worldRot, wreckRoot.transform, spec.IsMobileVehicle);
+            SpawnNativeDestructionFx(groundedPos, groundNormal, worldRot, wreckRoot.transform, spec.IsMobileVehicle, spawnExplosionFx);
             SpawnPhysicsDebris(package, spec, groundedPos);
 
             MdsWreckController controller = wreckRoot.AddComponent<MdsWreckController>();
             controller.Configure(wreckAnimator, fireParticles);
             ActiveWreckRoots.Add(wreckRoot);
             return wreckRoot;
+        }
+
+        private static bool HasNoVanillaWreckage(Unit unit)
+        {
+            if (unit is Building b)
+            {
+                return GameInteropHelpers.BuildingWreckageField?.GetValue(b) == null;
+            }
+
+            if (unit is GroundVehicle gv)
+            {
+                return GameInteropHelpers.GroundVehicleWreckageField?.GetValue(gv) == null;
+            }
+
+            return true;
         }
 
         internal static void CleanupWreck(GameObject? wreckRoot)
@@ -388,18 +496,46 @@ namespace MDSFramework.Deployment
             }
         }
 
-        private static Vector3 SnapToGround(Vector3 worldPos, out Vector3 groundNormal)
+        private static Vector3 SnapToGround(Vector3 worldPos, Unit? ignoreUnit, out Vector3 groundNormal)
         {
-            if (Physics.Raycast(
-                    worldPos + (Vector3.up * 4.0f),
-                    Vector3.down,
-                    out RaycastHit hit,
-                    12.0f,
-                    (int)PhysicsLayers.StaticsMask,
-                    QueryTriggerInteraction.Ignore))
+            RaycastHit[] hits = Physics.RaycastAll(
+                worldPos + (Vector3.up * 4.0f),
+                Vector3.down,
+                12.0f,
+                (int)PhysicsLayers.StaticsMask,
+                QueryTriggerInteraction.Ignore);
+
+            bool found = false;
+            float bestDist = float.MaxValue;
+            RaycastHit bestHit = default;
+
+            for (int i = 0; i < hits.Length; i++)
             {
-                groundNormal = hit.normal.sqrMagnitude > 0.001f ? hit.normal.normalized : Vector3.up;
-                return hit.point;
+                Collider? col = hits[i].collider;
+                if (col == null)
+                {
+                    continue;
+                }
+
+                if (ignoreUnit != null &&
+                    (col.transform.IsChildOf(ignoreUnit.transform) ||
+                     ReferenceEquals(col.GetComponentInParent<Unit>(), ignoreUnit)))
+                {
+                    continue;
+                }
+
+                if (hits[i].distance < bestDist)
+                {
+                    bestDist = hits[i].distance;
+                    bestHit = hits[i];
+                    found = true;
+                }
+            }
+
+            if (found)
+            {
+                groundNormal = bestHit.normal.sqrMagnitude > 0.001f ? bestHit.normal.normalized : Vector3.up;
+                return bestHit.point;
             }
 
             groundNormal = Vector3.up;
@@ -411,7 +547,8 @@ namespace MDSFramework.Deployment
             Vector3 groundNormal,
             Quaternion worldRot,
             Transform wreckRootTf,
-            bool isMobileVehicle)
+            bool isMobileVehicle,
+            bool spawnExplosionFx)
         {
             GameAssets? assets = GameAssets.i;
             if (assets == null)
@@ -419,7 +556,7 @@ namespace MDSFramework.Deployment
                 return;
             }
 
-            if (assets.vehicleWreckDestroyed != null)
+            if (spawnExplosionFx && assets.vehicleWreckDestroyed != null)
             {
                 Transform? origin = Datum.origin != null ? Datum.origin : wreckRootTf.parent;
                 GameObject explosionFx = origin != null

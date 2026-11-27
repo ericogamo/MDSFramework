@@ -105,6 +105,7 @@ namespace MDSFramework.Assets3D
                 if (tpl != null)
                 {
                     mat = new Material(tpl);
+                    ResetClonedTemplateMaterial(mat);
                 }
                 else
                 {
@@ -309,17 +310,31 @@ namespace MDSFramework.Assets3D
                 {
                     ownedTextures.Add(emTex);
                     mat.SetTexture(EmissionMapId, emTex);
-                    mat.EnableKeyword("_EMISSION");
                     if (mat.HasProperty(EmissionColorId))
                     {
-                        mat.SetColor(EmissionColorId, data.HasEmissive ? data.EmissiveColor : Color.white);
+                        mat.SetColor(EmissionColorId, data.HasEmissive ? data.EmissiveColor : Color.black);
                     }
 
-                    mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.RealtimeEmissive;
+                    if (data.HasEmissive)
+                    {
+                        mat.EnableKeyword("_EMISSION");
+                        mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.RealtimeEmissive;
+                    }
+                    else
+                    {
+                        mat.DisableKeyword("_EMISSION");
+                        mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.EmissiveIsBlack;
+                    }
                 }
                 else
                 {
                     UnityEngine.Object.Destroy(emTex);
+                    if (data.HasEmissive && mat.HasProperty(EmissionColorId))
+                    {
+                        mat.EnableKeyword("_EMISSION");
+                        mat.SetColor(EmissionColorId, data.EmissiveColor);
+                        mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.RealtimeEmissive;
+                    }
                 }
             }
             else if (data.HasEmissive && mat.HasProperty(EmissionColorId))
@@ -489,6 +504,70 @@ namespace MDSFramework.Assets3D
                 mat.SetOverrideTag("RenderType", "TransparentCutout");
                 mat.renderQueue = (int)RenderQueue.AlphaTest;
             }
+        }
+
+        private static void ResetClonedTemplateMaterial(Material mat)
+        {
+            mat.shaderKeywords = Array.Empty<string>();
+            mat.mainTexture = null;
+            mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.EmissiveIsBlack;
+
+            int[] texIds = { BaseMapId, MainTexId, BumpMapId, MetallicGlossMapId, OcclusionMapId, EmissionMapId };
+            for (int i = 0; i < texIds.Length; i++)
+            {
+                if (mat.HasProperty(texIds[i]))
+                {
+                    mat.SetTexture(texIds[i], null);
+                }
+            }
+
+            if (mat.HasProperty(EmissionColorId))
+            {
+                mat.SetColor(EmissionColorId, Color.black);
+            }
+
+            if (mat.HasProperty(BumpScaleId))
+            {
+                mat.SetFloat(BumpScaleId, 1f);
+            }
+
+            if (mat.HasProperty(OcclusionStrengthId))
+            {
+                mat.SetFloat(OcclusionStrengthId, 1f);
+            }
+
+            if (mat.HasProperty(CullId))
+            {
+                mat.SetInt(CullId, (int)CullMode.Back);
+            }
+
+            if (mat.HasProperty(SurfaceId))
+            {
+                mat.SetFloat(SurfaceId, 0f);
+            }
+
+            if (mat.HasProperty(AlphaClipId))
+            {
+                mat.SetFloat(AlphaClipId, 0f);
+            }
+
+            if (mat.HasProperty(SrcBlendId))
+            {
+                mat.SetInt(SrcBlendId, (int)BlendMode.One);
+            }
+
+            if (mat.HasProperty(DstBlendId))
+            {
+                mat.SetInt(DstBlendId, (int)BlendMode.Zero);
+            }
+
+            if (mat.HasProperty(ZWriteId))
+            {
+                mat.SetInt(ZWriteId, 1);
+            }
+
+            mat.SetOverrideTag("RenderType", "Opaque");
+            mat.renderQueue = -1;
         }
 
         private static Material? FindEncyclopediaTemplate()
