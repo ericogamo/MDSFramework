@@ -47,15 +47,22 @@ namespace MDSFramework.Patches
                 return;
             }
 
-            if (CustomMissileTracker.TryGet(__instance, out CustomMissileBehavior beh) &&
-                beh.Spec.StealthRcsOverride > 0f)
+            if (CustomMissileTracker.TryGet(__instance, out CustomMissileBehavior beh))
             {
-                __state = __instance.RCS;
-                __instance.RCS = beh.Spec.StealthRcsOverride;
+                if (beh.Spec.StealthRcsOverride > 0f)
+                {
+                    __state = __instance.RCS;
+                    __instance.RCS = beh.Spec.StealthRcsOverride;
+                }
+                else if (beh.Spec.IsDecoy || beh.Spec.FlightProfile == MissileFlightProfile.Decoy)
+                {
+                    __state = __instance.RCS;
+                    __instance.RCS = 6.5f;
+                }
             }
         }
 
-        private static void Postfix(Missile __instance, float __state)
+        private static void Finalizer(Missile __instance, float __state)
         {
             if (__instance != null && __state >= 0f)
             {

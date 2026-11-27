@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using HarmonyLib;
 using MDSFramework.Api;
 using MDSFramework.Assets3D;
 using MDSFramework.Deployment;
 using MDSFramework.Missiles;
+using MDSFramework.Networking;
 using Mirage;
 using NuclearOption.Networking;
 using UnityEngine;
@@ -16,9 +18,53 @@ namespace MDSFramework.Patches
     {
         private static void Postfix()
         {
-            MdsEncyclopediaCatalog.EnsureRegisteredAll();
-            AirdropCatalogManager.EnsureRegisteredAll();
-            AircraftMissileCatalogManager.EnsureRegisteredAll();
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
+        }
+    }
+
+    [HarmonyPatch(typeof(Encyclopedia), nameof(Encyclopedia.SortByValue))]
+    internal static class EncyclopediaSortByValueMdsGuardPatch
+    {
+        private static void Prefix(Encyclopedia __instance, out List<VehicleDefinition>? __state)
+        {
+            __state = null;
+            if (__instance == null || __instance.vehicles == null || __instance.vehicles.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = __instance.vehicles.Count - 1; i >= 0; i--)
+            {
+                VehicleDefinition? v = __instance.vehicles[i];
+                if (v != null && GameInteropHelpers.IsMdsSyntheticKey(v.jsonKey))
+                {
+                    __state ??= new List<VehicleDefinition>();
+                    __state.Add(v);
+                    __instance.vehicles.RemoveAt(i);
+                }
+            }
+
+            if (__state != null && __state.Count > 1)
+            {
+                __state.Sort((a, b) => string.Compare(a.jsonKey, b.jsonKey, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        private static void Finalizer(Encyclopedia __instance, List<VehicleDefinition>? __state)
+        {
+            if (__instance == null || __instance.vehicles == null || __state == null || __state.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < __state.Count; i++)
+            {
+                VehicleDefinition v = __state[i];
+                if (v != null && !__instance.vehicles.Contains(v))
+                {
+                    __instance.vehicles.Add(v);
+                }
+            }
         }
     }
 
@@ -223,6 +269,25 @@ namespace MDSFramework.Patches
         })]
     internal static class SpawnerAirdropContainerPatch
     {
+        private static void Prefix(UnitDefinition unit, out bool __state)
+        {
+            __state = false;
+            if (!GameInteropHelpers.IsServerAuthority() || unit == null)
+            {
+                return;
+            }
+
+            if (AirdropCatalogManager.TryResolveCargoDef(unit, out AirdropCatalogEntry entry))
+            {
+                PendingMdsSpawnScope.PushUnit(
+                    entry.Package,
+                    entry.Spec,
+                    entry.CargoDefinition,
+                    isCargoContainer: true);
+                __state = true;
+            }
+        }
+
         private static void Postfix(UnitDefinition unit, Unit owner, ref Unit __result)
         {
             if (!GameInteropHelpers.IsServerAuthority() ||
@@ -257,10 +322,17 @@ namespace MDSFramework.Patches
                 float refund = entry.Spec.Logistics != null ? Mathf.Max(0f, entry.Spec.Logistics.CreditCost) : 0f;
                 if (refund > 0f)
                 {
-                    RtsBridgeHost.Current.Economy.TrySpendFactionCredits(
-                        faction,
-                        -refund,
-                        $"Refund {entry.Spec.DisplayName} (Unit Cap Full)");
+                    if (owner is Aircraft ac && ac.Player != null)
+                    {
+                        ac.Player.AddAllocation(refund);
+                    }
+                    else
+                    {
+                        RtsBridgeHost.Current.Economy.TrySpendFactionCredits(
+                            faction,
+                            -refund,
+                            $"Refund {entry.Spec.DisplayName} (Unit Cap Full)");
+                    }
                 }
 
                 MdsLog.Warn($"[Airdrop] Unit cap full for '{entry.Spec.UnitId}' ({faction}); rejecting & removing container (refunded {refund:0}).");
@@ -271,6 +343,14 @@ namespace MDSFramework.Patches
             AirdropContainerBehavior behavior = container.gameObject.AddComponent<AirdropContainerBehavior>();
             behavior.ConsumedRtsCap = entry.Spec.Logistics != null;
             behavior.Initialize(entry.Package, entry.Spec, container, faction, ensureParachute: true);
+        }
+
+        private static void Finalizer(bool __state)
+        {
+            if (__state)
+            {
+                PendingMdsSpawnScope.Pop();
+            }
         }
     }
 
@@ -351,6 +431,12 @@ namespace MDSFramework.Patches
 
             if (!AirdropCatalogManager.TryResolveMount(mount, out AirdropCatalogEntry entry))
             {
+                return;
+            }
+
+            if (!MdsNetworkSync.GetEffectiveEnableNativeAircraftAirdrop())
+            {
+                __result = false;
                 return;
             }
 

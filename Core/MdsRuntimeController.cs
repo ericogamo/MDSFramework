@@ -3,6 +3,8 @@ using MDSFramework.Api;
 using MDSFramework.Assets3D;
 using MDSFramework.Deployment;
 using MDSFramework.Missiles;
+using MDSFramework.Networking;
+using MDSFramework.Patches;
 using MDSFramework.Sensors;
 using MDSFramework.Wta;
 using UnityEngine;
@@ -29,12 +31,13 @@ namespace MDSFramework
             wtaEngine = new SmartEngagementEngine();
             siteManager = new ModularSiteManager();
 
+            MdsNetworkSync.Initialize();
+            MdsCatalogCoordinator.Initialize();
             MdsEncyclopediaCatalog.Initialize();
-            MdsEncyclopediaCatalog.EnsureRegisteredAll();
             AirdropCatalogManager.Initialize();
-            AirdropCatalogManager.EnsureRegisteredAll();
+            AircraftMissileCatalogManager.EnsureInitializedSubscription();
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
 
-            SceneManager.sceneUnloaded += OnSceneUnloaded;
             SceneManager.activeSceneChanged += OnActiveSceneChanged;
         }
 
@@ -42,27 +45,28 @@ namespace MDSFramework
         {
             float dt = Time.deltaTime;
 
-            if (MdsConfig.EnableMissionEditorCatalog.Value &&
-                MdsEncyclopediaCatalog.RegisteredUnitCount == 0 &&
-                Encyclopedia.i != null &&
-                ContractorRegistry.GetPackages().Count > 0)
+            if (Encyclopedia.i != null &&
+                ContractorRegistry.GetPackages().Count > 0 &&
+                (MdsEncyclopediaCatalog.RegisteredUnitCount == 0 ||
+                 (!AirdropCatalogManager.NoTemplateAvailable && (AirdropCatalogManager.RegisteredMountCount == 0 || AirdropCatalogManager.InjectedAircraftCount == 0))))
             {
-                MdsEncyclopediaCatalog.EnsureRegisteredAll();
+                if (!AirdropCatalogManager.NoTemplateAvailable || Time.unscaledTime >= nextAirdropRetryTime)
+                {
+                    nextAirdropRetryTime = Time.unscaledTime + 1.0f;
+                    MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
+                }
             }
 
-            if (MdsConfig.EnableNativeAircraftAirdrop.Value &&
-                (AirdropCatalogManager.RegisteredMountCount == 0 || AirdropCatalogManager.InjectedAircraftCount == 0) &&
-                !AirdropCatalogManager.NoTemplateAvailable &&
-                Encyclopedia.i != null &&
-                Time.unscaledTime >= nextAirdropRetryTime)
+            MdsNetworkSync.Tick();
+
+            if (!GameInteropHelpers.IsGameplayActive())
             {
-                nextAirdropRetryTime = Time.unscaledTime + 1.0f;
-                AirdropCatalogManager.EnsureRegisteredAll();
-                AircraftMissileCatalogManager.EnsureRegisteredAll();
+                return;
             }
 
-            if (!GameInteropHelpers.IsGameplayActive() || !GameInteropHelpers.IsServerAuthority())
+            if (!GameInteropHelpers.IsServerAuthority())
             {
+                AheadAirburstManager.Tick(dt);
                 return;
             }
 
@@ -75,9 +79,20 @@ namespace MDSFramework
 
         private void OnGUI()
         {
-            if (MdsConfig.EnableDebugHudOverlay.Value && GameInteropHelpers.IsGameplayActive())
+            if (GameInteropHelpers.IsGameplayActive())
             {
-                DrawDebugHudStrip();
+                if (!string.IsNullOrEmpty(MdsNetworkSync.CatalogMismatchWarning))
+                {
+                    Color prevColor = GUI.color;
+                    GUI.color = new Color(1f, 0.35f, 0.35f, 1f);
+                    GUI.Box(new Rect(14f, 40f, 820f, 26f), MdsNetworkSync.CatalogMismatchWarning);
+                    GUI.color = prevColor;
+                }
+
+                if (MdsConfig.EnableDebugHudOverlay.Value)
+                {
+                    DrawDebugHudStrip();
+                }
             }
         }
 
@@ -98,9 +113,18 @@ namespace MDSFramework
             GUI.Box(new Rect(14f, 10f, 710f, 26f), text);
         }
 
-        private void OnSceneUnloaded(Scene _)
+        internal void TriggerNetworkSessionReset()
         {
             IsResettingScene = true;
+            try
+            {
+                ResetSessionStateCore(clearHeavyCaches: false);
+                MdsLog.Debug("MDS session reset on network disconnect/stop.");
+            }
+            finally
+            {
+                IsResettingScene = false;
+            }
         }
 
         private void OnActiveSceneChanged(Scene prev, Scene next)
@@ -108,21 +132,7 @@ namespace MDSFramework
             IsResettingScene = true;
             try
             {
-                wtaEngine.ResetSession();
-                abmWarning.ResetSession();
-                sensorNetwork.ResetSession();
-                siteManager.ResetSession();
-                CustomMissileTracker.ResetSession();
-                AheadAirburstManager.ResetSession();
-                MdsDestructionManager.ResetSession();
-                VanillaBridgeFallbacks.ResetSession();
-
-                if (next.name.IndexOf("Menu", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    GlbRuntimeLoader.ClearCache();
-                    WavAudioClipLoader.ClearCache();
-                }
-
+                ResetSessionStateCore(clearHeavyCaches: next.name.IndexOf("Menu", StringComparison.OrdinalIgnoreCase) >= 0);
                 MdsLog.Debug($"MDS session reset on scene change -> {next.name}");
             }
             finally
@@ -131,18 +141,45 @@ namespace MDSFramework
             }
         }
 
+        private void ResetSessionStateCore(bool clearHeavyCaches)
+        {
+            wtaEngine.ResetSession();
+            abmWarning.ResetSession();
+            sensorNetwork.ResetSession();
+            siteManager.ResetSession();
+            CustomMissileTracker.ResetSession();
+            MdsClientSiteProxy.ResetSession();
+            AheadAirburstManager.ResetSession();
+            MdsDestructionManager.ResetSession();
+            VanillaBridgeFallbacks.ResetSession();
+            MdsNetworkSync.ResetSession();
+            PendingMdsSpawnScope.Clear();
+            AirMissileLaunchTracker.Clear();
+            CustomMissileWarningAudioLookup.ResetSession();
+
+            if (clearHeavyCaches)
+            {
+                GlbRuntimeLoader.ClearCache();
+                WavAudioClipLoader.ClearCache();
+                UrpGlbMaterialBuilder.ClearExternalTextureCache();
+            }
+        }
+
         private void OnDestroy()
         {
-            SceneManager.sceneUnloaded -= OnSceneUnloaded;
             SceneManager.activeSceneChanged -= OnActiveSceneChanged;
+            MdsCatalogCoordinator.Dispose();
             MdsEncyclopediaCatalog.Dispose();
             AirdropCatalogManager.Dispose();
+            AircraftMissileCatalogManager.Dispose();
             abmWarning?.Dispose();
             siteManager?.Dispose();
             AheadAirburstManager.Dispose();
             MdsDestructionManager.Dispose();
+            CustomMissileWarningAudioLookup.Dispose();
             GlbRuntimeLoader.ClearCache();
             WavAudioClipLoader.ClearCache();
+            UrpGlbMaterialBuilder.ClearExternalTextureCache();
 
             if (ReferenceEquals(Instance, this))
             {

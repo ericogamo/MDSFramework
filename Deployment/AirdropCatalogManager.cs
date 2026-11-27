@@ -22,7 +22,6 @@ namespace MDSFramework.Deployment
         private static readonly Dictionary<string, AirdropCatalogEntry> EntriesByUnitId = new Dictionary<string, AirdropCatalogEntry>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, AirdropCatalogEntry> EntriesByKey = new Dictionary<string, AirdropCatalogEntry>(StringComparer.OrdinalIgnoreCase);
 
-        private static bool subscribedToRegistry;
         private static WeaponMount? cachedTemplateMount;
         private static UnitDefinition? cachedTemplateCargoDef;
         private static GameObject? mountPrefabHolder;
@@ -33,36 +32,32 @@ namespace MDSFramework.Deployment
 
         internal static void Initialize()
         {
-            if (!subscribedToRegistry)
-            {
-                subscribedToRegistry = true;
-                ContractorRegistry.OnPackageRegistered += OnPackageRegistered;
-            }
+            MdsCatalogCoordinator.Initialize();
         }
 
         internal static void Dispose()
         {
-            if (subscribedToRegistry)
-            {
-                subscribedToRegistry = false;
-                ContractorRegistry.OnPackageRegistered -= OnPackageRegistered;
-            }
         }
 
         internal static void EnsureRegisteredAll()
         {
-            if (!MdsConfig.EnableNativeAircraftAirdrop.Value || Encyclopedia.i == null)
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
+        }
+
+        internal static int EnsureRegisteredAllInternal(Encyclopedia enc)
+        {
+            if (enc == null)
             {
-                return;
+                return 0;
             }
 
             lock (SyncLock)
             {
-                if (!TryResolveContainerTemplate(Encyclopedia.i, out WeaponMount? templateMount, out UnitDefinition? templateCargoDef) ||
+                if (!TryResolveContainerTemplate(enc, out WeaponMount? templateMount, out UnitDefinition? templateCargoDef) ||
                     templateMount == null || templateCargoDef == null)
                 {
                     NoTemplateAvailable = true;
-                    return;
+                    return 0;
                 }
 
                 NoTemplateAvailable = false;
@@ -93,26 +88,27 @@ namespace MDSFramework.Deployment
 
                         if (EntriesByUnitId.TryGetValue(spec.UnitId, out AirdropCatalogEntry existing))
                         {
-                            RegisterDefinitionInEncyclopedia(Encyclopedia.i, existing.CargoDefinition, $"mds_cargo_{spec.UnitId}");
-                            RegisterMountInEncyclopedia(Encyclopedia.i, existing.WeaponMount, $"mds_airdrop_{spec.UnitId}");
+                            RegisterDefinitionInEncyclopedia(enc, existing.CargoDefinition, $"mds_cargo_{spec.UnitId}");
+                            RegisterMountInEncyclopedia(enc, existing.WeaponMount, $"mds_airdrop_{spec.UnitId}");
                             continue;
                         }
 
-                        if (RegisterUnitEntryLocked(Encyclopedia.i, pkg, spec, templateMount, templateCargoDef))
+                        if (RegisterUnitEntryLocked(enc, pkg, spec, templateMount, templateCargoDef))
                         {
                             newlyRegistered++;
                         }
                     }
                 }
 
-                InjectedAircraftCount = InjectAllEntriesIntoAircraftLocked(Encyclopedia.i);
+                InjectedAircraftCount = InjectAllEntriesIntoAircraftLocked(enc);
 
                 if (newlyRegistered > 0)
                 {
-                    MdsEncyclopediaCatalog.InvalidateMissionEditorCache();
                     MdsLog.Info(
                         $"[Airdrop] Registered {newlyRegistered} airdrop container mounts (total={RegisteredMountCount}, aircraft={InjectedAircraftCount}).");
                 }
+
+                return newlyRegistered;
             }
         }
 
@@ -216,7 +212,7 @@ namespace MDSFramework.Deployment
 
         private static void OnPackageRegistered(ContractorPackage _)
         {
-            EnsureRegisteredAll();
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
         }
 
         private static bool RegisterUnitEntryLocked(
@@ -432,6 +428,9 @@ namespace MDSFramework.Deployment
                 }
             }
 
+            var sortedEntries = new List<AirdropCatalogEntry>(EntriesByUnitId.Values);
+            sortedEntries.Sort((a, b) => string.Compare(a.Spec.UnitId, b.Spec.UnitId, StringComparison.OrdinalIgnoreCase));
+
             int equippedAircraft = 0;
             for (int a = 0; a < candidates.Count; a++)
             {
@@ -463,8 +462,9 @@ namespace MDSFramework.Deployment
                         continue;
                     }
 
-                    foreach (AirdropCatalogEntry entry in EntriesByUnitId.Values)
+                    for (int e = 0; e < sortedEntries.Count; e++)
                     {
+                        AirdropCatalogEntry entry = sortedEntries[e];
                         bool allowBay = isContainerSized ||
                                         MdsConfig.AllowAllCargoBays.Value ||
                                         entry.Spec.Logistics.AllowLightCargoBays;

@@ -32,6 +32,82 @@ namespace MDSFramework.Assets3D
 
         internal bool IsOnTarget { get; private set; }
         internal bool ReadyToStow { get; private set; } = true;
+        internal float CurrentYawDeg => currentYawDeg;
+        internal float CurrentPitchDeg => currentPitchDeg;
+
+        internal void SetReplicatedAngles(float yawDeg, float pitchDeg)
+        {
+            targetYawDeg = yawDeg;
+            targetPitchDeg = Mathf.Clamp(pitchDeg, minElevationDeg, maxElevationDeg);
+            desiredUnclampedPitchDeg = pitchDeg;
+            hasAimTarget = true;
+        }
+
+        internal void TickReplicatedClient(float deltaTime, bool radarEmitting, bool stowRequested)
+        {
+            if (rig == null || animator == null)
+            {
+                return;
+            }
+
+            if (beamVisibleTimer > 0f)
+            {
+                beamVisibleTimer -= deltaTime;
+                if (beamVisibleTimer <= 0f)
+                {
+                    if (beamRenderer != null)
+                    {
+                        beamRenderer.enabled = false;
+                    }
+                }
+                else
+                {
+                    UpdateBeamEndpoints();
+                }
+            }
+
+            if (!animator.IsFullyDeployed)
+            {
+                ReadyToStow = true;
+                return;
+            }
+
+            if (spinRadarDish && radarEmitting && !stowRequested && rig.RadarDish != null)
+            {
+                rig.RadarDish.Rotate(0f, radarSpinRateDegPerSec * deltaTime, 0f, Space.Self);
+            }
+
+            if (rig.TurretBase == null)
+            {
+                ReadyToStow = true;
+                return;
+            }
+
+            if (stowRequested || !animator.TargetDeployed)
+            {
+                float restYaw = NormalizeSignedAngle(animator.DeployedTurretBaseLocalRot.eulerAngles.y);
+                float restPitch = rig.TurretHead != null
+                    ? Mathf.Clamp(-NormalizeSignedAngle(animator.DeployedTurretHeadLocalRot.eulerAngles.x), minElevationDeg, maxElevationDeg)
+                    : 0f;
+
+                currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, restYaw, traverseRateDegPerSec * deltaTime);
+                currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, restPitch, elevationRateDegPerSec * deltaTime);
+                ApplyTurretRotations();
+                ReadyToStow = Mathf.Abs(Mathf.DeltaAngle(currentYawDeg, restYaw)) < 2.0f &&
+                              Mathf.Abs(currentPitchDeg - restPitch) < 2.0f;
+                return;
+            }
+
+            ReadyToStow = false;
+            if (!hasAimTarget)
+            {
+                return;
+            }
+
+            currentYawDeg = Mathf.MoveTowardsAngle(currentYawDeg, targetYawDeg, traverseRateDegPerSec * deltaTime);
+            currentPitchDeg = Mathf.MoveTowards(currentPitchDeg, targetPitchDeg, elevationRateDegPerSec * deltaTime);
+            ApplyTurretRotations();
+        }
 
         internal void Initialize(
             GlbInstantiatedRig instantiatedRig,

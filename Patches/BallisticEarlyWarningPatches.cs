@@ -26,7 +26,7 @@ namespace MDSFramework.Patches
     {
         private static void Postfix(Missile __instance)
         {
-            if (__instance == null)
+            if (!GameInteropHelpers.IsServerAuthority() || __instance == null)
             {
                 return;
             }
@@ -44,6 +44,18 @@ namespace MDSFramework.Patches
 
     [HarmonyPatch(typeof(Missile), nameof(Missile.DeployFins))]
     internal static class MissileDeployFinsPatch
+    {
+        private static void Postfix(Missile __instance)
+        {
+            if (__instance != null && CustomMissileTracker.TryGet(__instance, out CustomMissileBehavior custom))
+            {
+                custom.TriggerFinDeployment();
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(Missile), "UnfoldFins")]
+    internal static class MissileUnfoldFinsClientPatch
     {
         private static void Postfix(Missile __instance)
         {

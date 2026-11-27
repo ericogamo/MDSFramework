@@ -5,6 +5,7 @@ using System.Reflection;
 using MDSFramework.Api;
 using MDSFramework.Assets3D;
 using MDSFramework.Deployment;
+using MDSFramework.Networking;
 using MDSFramework.Sensors;
 using UnityEngine;
 
@@ -183,7 +184,7 @@ namespace MDSFramework.Missiles
                 ? Mathf.Clamp(Mathf.Max(110f, spec.MaxEngagementRangeKm * 5.6f), 110f, 380f)
                 : spec.IsAntiVehicle
                     ? Mathf.Clamp(Mathf.Max(120f, spec.MaxEngagementRangeKm * 15.0f), 120f, 360f)
-                    : Mathf.Clamp(Mathf.Max(25f, spec.MaxEngagementRangeKm * 2.0f), 25f, 150f);
+                    : Mathf.Clamp(spec.MaxEngagementRangeKm * 1.5f, 18f, 120f);
             weaveSeed = (missile.persistentID.Id % 17) * 0.43f;
             if (PassiveHojActive && targetUnit != null && !targetUnit.disabled)
             {
@@ -286,12 +287,36 @@ namespace MDSFramework.Missiles
             Package = package;
             Spec = spec;
             Missile = missile;
+
+            if (GameInteropHelpers.MissileBlastYieldField != null && spec.BlastYield > 0f)
+            {
+                try
+                {
+                    GameInteropHelpers.MissileBlastYieldField.SetValue(missile, spec.BlastYield);
+                }
+                catch
+                {
+                    // ignored
+                }
+            }
+
+            ExtendMotorForSpecRange();
             AttachCustomVisualRig();
             AttachCustomMotorAudio();
 
+            if (spec.StealthRcsOverride > 0f)
+            {
+                missile.RCS = spec.StealthRcsOverride;
+            }
+            else if (spec.IsDecoy || spec.FlightProfile == MissileFlightProfile.Decoy)
+            {
+                missile.RCS = 6.5f;
+            }
+
             if (spec.FlightProfile == MissileFlightProfile.SeaSkimmingEvasive &&
-                ((missile.ownerID.IsValid && missile.ownerID.TryGetUnit(out Unit ownerUnit) && ownerUnit is Aircraft) ||
-                 (missile.transform.position.y - Datum.LocalSeaY) > 35f))
+                missile.ownerID.IsValid &&
+                missile.ownerID.TryGetUnit(out Unit ownerUnit) &&
+                ownerUnit is Aircraft)
             {
                 airDropGlideActive = true;
                 airDropMotorIgnited = false;
@@ -303,6 +328,18 @@ namespace MDSFramework.Missiles
             CustomMissileTracker.Register(this);
             missile.onDisableUnit -= OnMissileDisabled;
             missile.onDisableUnit += OnMissileDisabled;
+        }
+
+        internal void ForceClientMotorIgnition()
+        {
+            if (!airDropGlideActive && airDropMotorIgnited)
+            {
+                return;
+            }
+
+            airDropMotorIgnited = true;
+            airDropGlideActive = false;
+            ReleaseFirstMotorDelay();
         }
 
         internal void TriggerFinDeployment()
@@ -438,12 +475,15 @@ namespace MDSFramework.Missiles
                 }
             }
 
+            bool allowScaleDown = !Spec.IsAntiShip && !Spec.IsAntiVehicle;
             float desiredBurn = Spec.IsAntiShip
                 ? Mathf.Clamp(Spec.MaxEngagementRangeKm * 4.8f, 60f, 320f)
                 : Spec.IsAntiVehicle
                     ? Mathf.Clamp(Spec.MaxEngagementRangeKm * 13.5f, 60f, 320f)
-                    : Mathf.Clamp(Spec.MaxEngagementRangeKm * 0.30f, 8f, 30f);
-            float scale = totalBurn > 0.1f && totalBurn < desiredBurn ? desiredBurn / totalBurn : 1f;
+                    : Mathf.Clamp(Spec.MaxEngagementRangeKm * 0.22f, 3.5f, 24f);
+            float scale = totalBurn > 0.1f && (allowScaleDown || totalBurn < desiredBurn)
+                ? desiredBurn / totalBurn
+                : 1f;
             float maxSpeedCap = GetEffectiveMaxSpeedMps();
 
             for (int i = 0; i < motors.Length; i++)
@@ -454,15 +494,17 @@ namespace MDSFramework.Missiles
                     continue;
                 }
 
-                if (scale > 1.01f && burnTimeField.GetValue(motorObj) is float bt && bt > 0f)
+                if (Mathf.Abs(scale - 1f) > 0.02f && burnTimeField.GetValue(motorObj) is float bt && bt > 0f)
                 {
-                    float newBt = bt * scale;
+                    float newBt = Mathf.Max(0.25f, bt * scale);
                     burnTimeField.SetValue(motorObj, newBt);
                     if (burnRateField != null && fuelMassField != null &&
                         burnRateField.GetValue(motorObj) is float br && br > 0f &&
                         fuelMassField.GetValue(motorObj) is float fm && fm > 0f)
                     {
-                        burnRateField.SetValue(motorObj, fm / newBt);
+                        float newFm = Mathf.Max(1f, fm * scale);
+                        fuelMassField.SetValue(motorObj, newFm);
+                        burnRateField.SetValue(motorObj, newFm / newBt);
                     }
                 }
 
@@ -606,7 +648,16 @@ namespace MDSFramework.Missiles
                 customMotorAudioSource.Play();
             }
 
-            float spd = Missile.rb != null ? Missile.rb.velocity.magnitude : Mathf.Max(80f, Spec.CruiseSpeedMps);
+            float spd = Missile.rb != null ? Missile.rb.velocity.magnitude : 0f;
+            if (Missile.remoteSim && spd < 1f && hasPrevVisualPos && dt > 0.001f)
+            {
+                spd = (Missile.transform.position - prevVisualPos).magnitude / dt;
+            }
+
+            if (spd < 1f)
+            {
+                spd = Mathf.Max(80f, Spec.CruiseSpeedMps);
+            }
             float speedNorm = Mathf.Clamp01((spd - 60f) / 130f);
             float diveFactor = Mathf.Clamp01(-Missile.transform.forward.y);
             float targetPitch = customMotorBasePitch * (0.86f + (speedNorm * 0.34f) + (diveFactor * 0.38f));
@@ -682,20 +733,12 @@ namespace MDSFramework.Missiles
 
             animator?.TickAnimation(dt, allowTurretOverrides: false);
 
-            if (Spec.IsAntiShip && Spec.TargetMach > 0f &&
-                ageSeconds > (Spec.BoosterDropSeconds > 0f ? Spec.BoosterDropSeconds * 0.7f : 1.0f))
-            {
-                float targetMps = Spec.TargetMach * 340.3f;
-                float throttle = Mathf.Clamp(0.55f + ((targetMps - Missile.speed) * 0.025f), 0.12f, 1.0f);
-                Missile.SetThrottle(throttle);
-            }
-
             if (Missile.remoteSim)
             {
                 if (airDropGlideActive && !airDropMotorIgnited)
                 {
                     float clientHeight = Missile.transform.position.y - Datum.LocalSeaY;
-                    if (ageSeconds >= 0.85f && (clientHeight <= 24f || ageSeconds >= 18f))
+                    if (ageSeconds >= 0.85f && (clientHeight <= 24f || ageSeconds >= 38f))
                     {
                         airDropMotorIgnited = true;
                         airDropGlideActive = false;
@@ -710,6 +753,14 @@ namespace MDSFramework.Missiles
                 UpdateCustomMotorAudio(dt);
                 UpdateFlightControlSurfaceAnimation(dt);
                 return;
+            }
+
+            if (Spec.IsAntiShip && Spec.TargetMach > 0f &&
+                ageSeconds > (Spec.BoosterDropSeconds > 0f ? Spec.BoosterDropSeconds * 0.7f : 1.0f))
+            {
+                float targetMps = Spec.TargetMach * 340.3f;
+                float throttle = Mathf.Clamp(0.55f + ((targetMps - Missile.speed) * 0.025f), 0.12f, 1.0f);
+                Missile.SetThrottle(throttle);
             }
 
             hojUpdatedAimThisTick = false;
@@ -871,6 +922,11 @@ namespace MDSFramework.Missiles
                 airDropMotorIgnited = true;
                 airDropGlideActive = false;
                 ReleaseFirstMotorDelay();
+                if (Missile.persistentID.IsValid)
+                {
+                    MdsNetworkSync.BroadcastMissileIgnition(Missile.persistentID.Id);
+                }
+
                 UpdateActivePassiveHoj(dt);
                 UpdateActiveTargetDatalink();
                 UpdateFlightProfileGuidance(dt);

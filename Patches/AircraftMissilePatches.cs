@@ -17,28 +17,45 @@ namespace MDSFramework.Patches
             internal Unit Owner;
             internal MountedMissile Mounted;
             internal AirMissileCatalogEntry Entry;
+            internal string ExpectedPrefabName;
+            internal Vector3 OwnerPos;
             internal float ExpireTime;
         }
 
         private static readonly List<PendingAirLaunch> Pending = new List<PendingAirLaunch>(16);
 
+        internal static void Clear()
+        {
+            Pending.Clear();
+        }
+
         internal static void RecordFire(Unit owner, MountedMissile mounted, AirMissileCatalogEntry entry)
         {
+            if (!GameInteropHelpers.IsServerAuthority())
+            {
+                return;
+            }
+
             PurgeExpired();
+            string expectedPrefab = entry.ClonedInfo?.weaponPrefab != null ? entry.ClonedInfo.weaponPrefab.name : string.Empty;
             Pending.Add(new PendingAirLaunch
             {
                 Owner = owner,
                 Mounted = mounted,
                 Entry = entry,
+                ExpectedPrefabName = expectedPrefab,
+                OwnerPos = owner.transform.position,
                 ExpireTime = Time.unscaledTime + 12f
             });
         }
 
-        internal static bool TryConsume(Unit? owner, Vector3 spawnPos, out AirMissileCatalogEntry entry)
+        internal static bool TryConsume(Unit? owner, GameObject? missilePrefab, Vector3 spawnPos, out AirMissileCatalogEntry entry)
         {
             PurgeExpired();
+            const float maxDistSq = 250f * 250f;
             int bestIdx = -1;
-            float bestDistSq = float.MaxValue;
+            float bestDistSq = maxDistSq;
+            string prefabName = missilePrefab != null ? missilePrefab.name : string.Empty;
 
             for (int i = 0; i < Pending.Count; i++)
             {
@@ -48,17 +65,20 @@ namespace MDSFramework.Patches
                     continue;
                 }
 
-                if (item.Mounted != null)
+                if (!string.IsNullOrEmpty(item.ExpectedPrefabName) &&
+                    !string.IsNullOrEmpty(prefabName) &&
+                    !string.Equals(item.ExpectedPrefabName, prefabName, StringComparison.OrdinalIgnoreCase))
                 {
-                    float dSq = (item.Mounted.transform.position - spawnPos).sqrMagnitude;
-                    if (dSq < bestDistSq)
-                    {
-                        bestDistSq = dSq;
-                        bestIdx = i;
-                    }
+                    continue;
                 }
-                else if (bestIdx < 0)
+
+                Vector3 refPos = item.Mounted != null
+                    ? item.Mounted.transform.position
+                    : (item.Owner != null ? item.Owner.transform.position : item.OwnerPos);
+                float dSq = (refPos - spawnPos).sqrMagnitude;
+                if (dSq < bestDistSq)
                 {
+                    bestDistSq = dSq;
                     bestIdx = i;
                 }
             }
@@ -183,14 +203,20 @@ namespace MDSFramework.Patches
             if (AircraftMissileCatalogManager.TryResolveMount(resolvedMount, out AirMissileCatalogEntry entry) ||
                 AircraftMissileCatalogManager.TryResolveInfo(__instance.info, out entry))
             {
-                bool enforceShipOnly = entry.Spec.IsAntiShip &&
-                    (owner.IsServer || owner.HasAuthority || GameManager.gameState == GameState.SinglePlayer);
-                if (enforceShipOnly && !AntiShipTargetingPatches.IsValidAntiShipTarget(target))
+                bool isLocalOrSingleplayer = owner.HasAuthority || GameManager.gameState == GameState.SinglePlayer;
+                bool isRemoteClientOnServer = owner.IsServer && !owner.HasAuthority && GameManager.gameState == GameState.Multiplayer;
+                if (entry.Spec.IsAntiShip && isLocalOrSingleplayer && !AntiShipTargetingPatches.IsValidAntiShipTarget(target))
                 {
                     string weaponName = string.IsNullOrEmpty(entry.ClonedInfo.shortName)
                         ? entry.Spec.DisplayName
                         : entry.ClonedInfo.shortName;
                     AntiShipTargetingPatches.ReportShipsOnlyIfLocalPlayer(owner, weaponName);
+                    return false;
+                }
+
+                // On server handling a remote client's CmdLaunchMissile, accept recently disabled Ships so ammo/mass doesn't split-brain.
+                if (entry.Spec.IsAntiShip && isRemoteClientOnServer && !(target is Ship))
+                {
                     return false;
                 }
 
@@ -207,7 +233,7 @@ namespace MDSFramework.Patches
         new[] { typeof(GameObject), typeof(Vector3), typeof(Quaternion), typeof(Vector3), typeof(Unit), typeof(Unit) })]
     internal static class SpawnerSpawnAirMissilePatch
     {
-        private static void Prefix(Vector3 launchPosition, Unit owner, out AirMissileCatalogEntry? __state)
+        private static void Prefix(GameObject missile, Vector3 launchPosition, Unit owner, out AirMissileCatalogEntry? __state)
         {
             __state = null;
             if (!GameInteropHelpers.IsServerAuthority() || owner == null)
@@ -215,7 +241,7 @@ namespace MDSFramework.Patches
                 return;
             }
 
-            if (AirMissileLaunchTracker.TryConsume(owner, launchPosition, out AirMissileCatalogEntry entry))
+            if (AirMissileLaunchTracker.TryConsume(owner, missile, launchPosition, out AirMissileCatalogEntry entry))
             {
                 PendingMdsSpawnScope.PushMissile(entry.Package, entry.Spec, entry.MissileDefinition);
                 __state = entry;

@@ -14,8 +14,26 @@ namespace MDSFramework.Deployment
         private bool isSecondarySlot;
         private int maxCapacity;
         private int fallbackAmmo;
+        private int replicatedAmmo = -1;
         private int lastSyncedAmmo;
         private bool insideExternalAbsorb;
+
+        internal bool IsSecondarySlot => isSecondarySlot;
+
+        internal void SetReplicatedAmmo(int newAmmo)
+        {
+            int clamped = Mathf.Clamp(newAmmo, 0, maxCapacity);
+            replicatedAmmo = clamped;
+            fallbackAmmo = clamped;
+            ammo = clamped;
+            lastSyncedAmmo = clamped;
+            if (weaponStation != null)
+            {
+                weaponStation.Ammo = clamped;
+                weaponStation.FullAmmo = maxCapacity;
+                weaponStation.Updated();
+            }
+        }
 
         internal void Configure(
             Unit ownerUnit,
@@ -99,7 +117,8 @@ namespace MDSFramework.Deployment
             AbsorbExternalAmmoAdditions();
             if (site == null)
             {
-                return Mathf.Clamp(fallbackAmmo, 0, maxCapacity);
+                int val = replicatedAmmo >= 0 ? replicatedAmmo : fallbackAmmo;
+                return Mathf.Clamp(val, 0, maxCapacity);
             }
 
             int remaining = isSecondarySlot
@@ -183,7 +202,8 @@ namespace MDSFramework.Deployment
             Unit unit,
             ContractorPackage package,
             ModularUnitSpec spec,
-            ModularSiteBehavior? site)
+            ModularSiteBehavior? site,
+            MdsClientSiteProxy? clientProxy = null)
         {
             if (unit == null)
             {
@@ -203,6 +223,7 @@ namespace MDSFramework.Deployment
             }
 
             site?.WeaponProxies.Clear();
+            clientProxy?.WeaponProxies.Clear();
 
             if (spec.Role == WeaponCascadeRole.FireControl ||
                 spec.Role == WeaponCascadeRole.EarlyWarningRadar ||
@@ -221,14 +242,14 @@ namespace MDSFramework.Deployment
             if (spec.Role == WeaponCascadeRole.CloseInGun)
             {
                 WeaponInfo info = GetOrCreateGunWeaponInfo(package, spec);
-                AddStation(unit, info, site, secondarySlot: false, capacity: Math.Max(1, primaryCap), rearmable: true);
+                AddStation(unit, info, site, clientProxy, secondarySlot: false, capacity: Math.Max(1, primaryCap), rearmable: true);
                 return;
             }
 
             if (spec.Role == WeaponCascadeRole.LaserHel)
             {
                 WeaponInfo info = GetOrCreateHelWeaponInfo(package, spec);
-                AddStation(unit, info, site, secondarySlot: false, capacity: 100, rearmable: false);
+                AddStation(unit, info, site, clientProxy, secondarySlot: false, capacity: 100, rearmable: false);
                 return;
             }
 
@@ -236,7 +257,7 @@ namespace MDSFramework.Deployment
                 ContractorRegistry.TryGetMissileSpec(spec.PrimaryMissileId, out ContractorPackage primaryPkg, out CustomMissileSpec primaryMissile))
             {
                 WeaponInfo info = GetOrCreateMissileWeaponInfo(primaryPkg, primaryMissile, spec);
-                AddStation(unit, info, site, secondarySlot: false, capacity: Math.Max(1, primaryCap), rearmable: true);
+                AddStation(unit, info, site, clientProxy, secondarySlot: false, capacity: Math.Max(1, primaryCap), rearmable: true);
             }
 
             if (secondaryCap > 0 &&
@@ -244,7 +265,7 @@ namespace MDSFramework.Deployment
                 ContractorRegistry.TryGetMissileSpec(spec.SecondaryMissileId, out ContractorPackage secondaryPkg, out CustomMissileSpec secondaryMissile))
             {
                 WeaponInfo info = GetOrCreateMissileWeaponInfo(secondaryPkg, secondaryMissile, spec);
-                AddStation(unit, info, site, secondarySlot: true, capacity: secondaryCap, rearmable: true);
+                AddStation(unit, info, site, clientProxy, secondarySlot: true, capacity: secondaryCap, rearmable: true);
             }
         }
 
@@ -312,6 +333,7 @@ namespace MDSFramework.Deployment
             Unit unit,
             WeaponInfo info,
             ModularSiteBehavior? site,
+            MdsClientSiteProxy? clientProxy,
             bool secondarySlot,
             int capacity,
             bool rearmable)
@@ -329,6 +351,7 @@ namespace MDSFramework.Deployment
             station.Weapons.Add(proxy);
             unit.weaponStations.Add(station);
             site?.WeaponProxies.Add(proxy);
+            clientProxy?.WeaponProxies.Add(proxy);
         }
 
         private static WeaponInfo GetOrCreateGunWeaponInfo(ContractorPackage pkg, ModularUnitSpec spec)

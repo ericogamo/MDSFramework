@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using MDSFramework.Api;
 using MDSFramework.Patches;
 using MDSFramework.Sensors;
@@ -49,6 +50,51 @@ namespace MDSFramework.Missiles
         {
             activeWarnings.Clear();
             notifiedThreatIds.Clear();
+        }
+
+        internal void ApplyClientSnapshot(string encoded)
+        {
+            activeWarnings.Clear();
+            notifiedThreatIds.Clear();
+            if (string.IsNullOrEmpty(encoded))
+            {
+                return;
+            }
+
+            string[] rows = encoded.Split(';');
+            for (int i = 0; i < rows.Length; i++)
+            {
+                string[] cols = rows[i].Split(',');
+                if (cols.Length < 6)
+                {
+                    continue;
+                }
+
+                uint pidId = uint.TryParse(cols[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out uint p) ? p : 0u;
+                int fInt = int.TryParse(cols[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int fi) ? fi : 0;
+                float x = float.TryParse(cols[2], NumberStyles.Float, CultureInfo.InvariantCulture, out float vx) ? vx : 0f;
+                float y = float.TryParse(cols[3], NumberStyles.Float, CultureInfo.InvariantCulture, out float vy) ? vy : 0f;
+                float z = float.TryParse(cols[4], NumberStyles.Float, CultureInfo.InvariantCulture, out float vz) ? vz : 0f;
+                float yield = float.TryParse(cols[5], NumberStyles.Float, CultureInfo.InvariantCulture, out float yld) ? yld : 0f;
+
+                var pid = new PersistentID { Id = pidId };
+                Missile? m = null;
+                if (pidId != 0 && pid.TryGetUnit(out Unit u) && u is Missile missile)
+                {
+                    m = missile;
+                    notifiedThreatIds.Add(pidId);
+                }
+
+                activeWarnings.Add(new BallisticWarningEntry
+                {
+                    ThreatId = pid,
+                    ThreatMissile = m,
+                    TargetFaction = Enum.IsDefined(typeof(FactionAffinity), fInt) ? (FactionAffinity)fInt : FactionAffinity.Any,
+                    LastPosition = new Vector3(x, y, z),
+                    BlastYield = yield,
+                    DetectedTime = Time.time
+                });
+            }
         }
 
         internal void Tick()

@@ -2,6 +2,7 @@ using System;
 using MDSFramework.Api;
 using MDSFramework.Assets3D;
 using MDSFramework.Missiles;
+using MDSFramework.Networking;
 using MDSFramework.Sensors;
 using UnityEngine;
 
@@ -177,6 +178,7 @@ namespace MDSFramework.Deployment
             Container.transform.rotation = Quaternion.Euler(0f, euler.y, 0f);
 
             ActivatedSite = ModularSiteManager.Instance.ActivateLandedContainerSite(this);
+            MdsNetworkSync.BroadcastContainerLanded(Container.persistentID.Id, euler.y, Spec.ContainerLengthMeters);
             if (ActivatedSite != null && MdsConfig.AutoDeployBrieflyOnTouchdown.Value)
             {
                 ActivatedSite.LastThreatSeenTime = Time.time;
@@ -328,6 +330,14 @@ namespace MDSFramework.Deployment
         private static void EnsureParachuteAttached(Container container)
         {
             if (container.GetComponentInChildren<CargoDeploymentSystem>(true) != null)
+            {
+                return;
+            }
+
+            if (Physics.Linecast(
+                    container.transform.position,
+                    container.transform.position - (Vector3.up * 10f),
+                    PhysicsLayers.StaticsMask))
             {
                 return;
             }

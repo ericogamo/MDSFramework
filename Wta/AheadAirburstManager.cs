@@ -4,6 +4,7 @@ using System.IO;
 using MDSFramework.Api;
 using MDSFramework.Assets3D;
 using MDSFramework.Missiles;
+using MDSFramework.Networking;
 using MDSFramework.Sensors;
 using UnityEngine;
 using UnityEngine.Audio;
@@ -30,6 +31,7 @@ namespace MDSFramework.Wta
             internal float ProgrammedFuseSeconds;
             internal float DamagePerBurst;
             internal bool CanEngageGroundVehicles;
+            internal bool IsAuthoritative;
             internal GameObject? VisualGo;
             internal LineRenderer? Line;
             internal GameObject? ShellVisualGo;
@@ -47,9 +49,16 @@ namespace MDSFramework.Wta
             internal Vector3 DriftVelocity;
         }
 
+        private sealed class ClientGunAudioState
+        {
+            internal AudioSource[]? Voices;
+            internal int Cursor;
+        }
+
         private struct PendingShotAudio
         {
-            internal ModularSiteBehavior Site;
+            internal ModularSiteBehavior? Site;
+            internal Unit? ClientUnit;
             internal AudioClip Clip;
             internal float RemainingDelay;
             internal float Volume;
@@ -60,6 +69,8 @@ namespace MDSFramework.Wta
         private static readonly List<AheadProjectile> Projectiles = new List<AheadProjectile>(MaxActiveProjectiles);
         private static readonly List<AheadBurstFlash> Flashes = new List<AheadBurstFlash>(MaxActiveFlashes);
         private static readonly List<PendingShotAudio> PendingAudioShots = new List<PendingShotAudio>(32);
+        private static readonly List<Missile> PreDisarmedScratch = new List<Missile>(8);
+        private static readonly Dictionary<int, ClientGunAudioState> ClientAudioByInstanceId = new Dictionary<int, ClientGunAudioState>();
 
         private static Material? tracerMaterial;
         private static Material? burstMaterial;
@@ -173,6 +184,7 @@ namespace MDSFramework.Wta
                     ProgrammedFuseSeconds = Mathf.Max(0.025f, baseFuseSeconds + fuseOffset),
                     DamagePerBurst = burstDmg * 0.6f,
                     CanEngageGroundVehicles = site.Spec.CanEngageGroundVehicles,
+                    IsAuthoritative = true,
                     VisualGo = visualGo,
                     Line = line,
                     ShellVisualGo = shellVisualGo,
@@ -181,7 +193,101 @@ namespace MDSFramework.Wta
                 });
             }
 
+            MdsNetworkSync.BroadcastAheadBurst(site, muzzlePos, baseDir, muzzleVel, baseFuseSeconds);
             TriggerBurstAudio(site, 2);
+        }
+
+        internal static void SpawnClientVisualBurst(
+            Unit? siteUnit,
+            ContractorPackage? pkg,
+            ModularUnitSpec? spec,
+            Vector3 muzzlePos,
+            Vector3 baseDir,
+            float muzzleVel,
+            float baseFuseSeconds)
+        {
+            string? shellGlbPath = null;
+            if (MdsConfig.EnableCustomGlbVisuals.Value &&
+                pkg != null &&
+                spec != null &&
+                !string.IsNullOrWhiteSpace(spec.GunProjectileGlbRelativePath))
+            {
+                string? resolved = CustomMissileBehavior.ResolveAssetPath(
+                    pkg,
+                    spec.GunProjectileGlbRelativePath,
+                    Array.Empty<string>());
+                if (!string.IsNullOrEmpty(resolved) && File.Exists(resolved))
+                {
+                    shellGlbPath = resolved;
+                }
+            }
+
+            float shellScale = spec != null ? Mathf.Clamp(spec.GunProjectileVisualScale, 0.5f, 25f) : 1f;
+            string shellCacheKey = spec != null ? $"ahead_shell_{spec.UnitId}" : "ahead_shell_client";
+
+            for (int shot = 0; shot < 2; shot++)
+            {
+                if (Projectiles.Count >= MaxActiveProjectiles)
+                {
+                    DestroyProjectileVisual(Projectiles[0]);
+                    Projectiles.RemoveAt(0);
+                }
+
+                Vector3 jitter = UnityEngine.Random.insideUnitSphere * 0.0044f;
+                Vector3 shotDir = (baseDir + jitter).normalized;
+                Vector3 spawnPos = muzzlePos + (shotDir * (shot * 6f));
+                float fuseOffset = shot * 0.014f;
+
+                CreateTracerVisual(spawnPos, shotDir, out GameObject visualGo, out LineRenderer line);
+                GameObject? shellVisualGo = null;
+                GlbKeyframedAnimator? shellAnimator = null;
+                if (!string.IsNullOrEmpty(shellGlbPath))
+                {
+                    var shellParent = new GameObject("MDS_AheadShell3D");
+                    shellParent.transform.position = spawnPos;
+                    shellParent.transform.rotation = Quaternion.LookRotation(shotDir);
+                    shellParent.transform.localScale = Vector3.one * shellScale;
+                    GlbInstantiatedRig? shellRig = GlbRuntimeLoader.Instantiate(
+                        shellCacheKey,
+                        shellGlbPath,
+                        "projectile",
+                        null,
+                        shellParent.transform,
+                        180f);
+                    if (shellRig != null)
+                    {
+                        shellAnimator = shellRig.RootObject.GetComponent<GlbKeyframedAnimator>()
+                            ?? shellRig.RootObject.AddComponent<GlbKeyframedAnimator>();
+                        shellAnimator.Initialize(shellRig, 0.26f, startDeployed: false);
+                        shellVisualGo = shellParent;
+                    }
+                    else
+                    {
+                        UnityEngine.Object.Destroy(shellParent);
+                    }
+                }
+
+                Projectiles.Add(new AheadProjectile
+                {
+                    OwnerUnit = siteUnit,
+                    LaunchOrigin = spawnPos,
+                    Position = spawnPos,
+                    Velocity = shotDir * muzzleVel,
+                    Elapsed = 0f,
+                    ProgrammedFuseSeconds = Mathf.Clamp(baseFuseSeconds + fuseOffset, 0.025f, 4.0f),
+                    IsAuthoritative = false,
+                    VisualGo = visualGo,
+                    Line = line,
+                    ShellVisualGo = shellVisualGo,
+                    ShellAnimator = shellAnimator,
+                    SpinDeg = shot * 90f
+                });
+            }
+
+            if (siteUnit != null && pkg != null && spec != null)
+            {
+                TriggerClientBurstAudio(siteUnit, pkg, spec, 2);
+            }
         }
 
         internal static void Tick(float deltaTime)
@@ -280,6 +386,8 @@ namespace MDSFramework.Wta
 
             Flashes.Clear();
             PendingAudioShots.Clear();
+            PreDisarmedScratch.Clear();
+            ClientAudioByInstanceId.Clear();
         }
 
         internal static void Dispose()
@@ -308,6 +416,30 @@ namespace MDSFramework.Wta
             proj.ShellAnimator = null;
             SpawnAirburstVisual(burstPos, forward, shellGo, shellAnim, proj.SpinDeg);
 
+            if (!proj.IsAuthoritative || !GameInteropHelpers.IsServerAuthority())
+            {
+                return;
+            }
+
+            PreDisarmedScratch.Clear();
+            if (MdsConfig.EnableHighAltitudeDisarm.Value && UnitRegistry.allUnits != null)
+            {
+                float threshold = MdsConfig.AbmBlastYieldThreshold.Value;
+                for (int i = 0; i < UnitRegistry.allUnits.Count; i++)
+                {
+                    if (UnitRegistry.allUnits[i] is Missile m &&
+                        !m.disabled &&
+                        (m.transform.position.y - Datum.LocalSeaY) >= 800f &&
+                        (m.transform.position - burstPos).sqrMagnitude <= 55f * 55f &&
+                        GameInteropHelpers.SafeGetBlastYield(m) >= threshold &&
+                        m.IsArmed() &&
+                        GameInteropHelpers.SafeDisarmWarhead(m))
+                    {
+                        PreDisarmedScratch.Add(m);
+                    }
+                }
+            }
+
             PersistentID dealerId = proj.OwnerUnit != null ? proj.OwnerUnit.persistentID : PersistentID.None;
             try
             {
@@ -317,6 +449,17 @@ namespace MDSFramework.Wta
             {
                 MdsLog.Debug($"Ahead BlastFrag skipped: {ex.Message}");
             }
+
+            for (int i = 0; i < PreDisarmedScratch.Count; i++)
+            {
+                Missile m = PreDisarmedScratch[i];
+                if (m != null && !m.disabled)
+                {
+                    m.Arm();
+                }
+            }
+
+            PreDisarmedScratch.Clear();
 
             bool hitPrimary = false;
             if (proj.Target != null && !proj.Target.disabled)
@@ -601,6 +744,54 @@ namespace MDSFramework.Wta
             }
         }
 
+        private static void TriggerClientBurstAudio(Unit siteUnit, ContractorPackage pkg, ModularUnitSpec spec, int shotCount)
+        {
+            if (shotCount <= 0 || string.IsNullOrWhiteSpace(spec.GunFireAudioRelativePath))
+            {
+                return;
+            }
+
+            string? audioPath = CustomMissileBehavior.ResolveAssetPath(
+                pkg,
+                spec.GunFireAudioRelativePath,
+                Array.Empty<string>());
+            if (string.IsNullOrEmpty(audioPath) || !File.Exists(audioPath))
+            {
+                return;
+            }
+
+            AudioClip? clip = WavAudioClipLoader.LoadOrGet(audioPath);
+            if (clip == null)
+            {
+                return;
+            }
+
+            float volume = Mathf.Clamp(spec.GunFireAudioVolume, 0f, 1.5f);
+            float pMin = Mathf.Clamp(spec.GunFireAudioPitchMin, 0.5f, 1.5f);
+            float pMax = Mathf.Clamp(Mathf.Max(pMin, spec.GunFireAudioPitchMax), 0.5f, 1.5f);
+            float interval = Mathf.Clamp(spec.GunBurstShotIntervalSeconds, 0.03f, 0.25f);
+
+            PlayClientGunShot(siteUnit, spec, clip, volume, pMin, pMax);
+
+            for (int shot = 1; shot < shotCount; shot++)
+            {
+                if (PendingAudioShots.Count >= 64)
+                {
+                    break;
+                }
+
+                PendingAudioShots.Add(new PendingShotAudio
+                {
+                    ClientUnit = siteUnit,
+                    Clip = clip,
+                    RemainingDelay = shot * interval,
+                    Volume = volume,
+                    PitchMin = pMin,
+                    PitchMax = pMax
+                });
+            }
+        }
+
         private static void TickPendingAudioShots(float dt)
         {
             for (int i = PendingAudioShots.Count - 1; i >= 0; i--)
@@ -614,28 +805,30 @@ namespace MDSFramework.Wta
                 }
 
                 PendingAudioShots.RemoveAt(i);
-                if (pending.Site != null && pending.Site.IsAlive && pending.Clip != null)
+                if (pending.Clip == null)
+                {
+                    continue;
+                }
+
+                if (pending.Site != null && pending.Site.IsAlive)
                 {
                     PlaySiteGunShot(pending.Site, pending.Clip, pending.Volume, pending.PitchMin, pending.PitchMax);
+                }
+                else if (pending.ClientUnit != null && !pending.ClientUnit.disabled)
+                {
+                    MdsClientSiteProxy? proxy = pending.ClientUnit.GetComponent<MdsClientSiteProxy>();
+                    if (proxy != null && proxy.Spec != null)
+                    {
+                        PlayClientGunShot(pending.ClientUnit, proxy.Spec, pending.Clip, pending.Volume, pending.PitchMin, pending.PitchMax);
+                    }
                 }
             }
         }
 
-        private static AudioSource[]? EnsureGunAudioVoices(ModularSiteBehavior site)
+        private static AudioSource[]? EnsureGunAudioVoicesForUnit(Unit unit, Transform anchor, ModularUnitSpec spec)
         {
-            if (site.Unit == null)
-            {
-                return null;
-            }
-
-            AudioSource[]? existing = site.GunAudioVoices;
-            if (existing != null && existing.Length > 0 && existing[0] != null)
-            {
-                return existing;
-            }
-
             AudioMixerGroup? mixerGroup = null;
-            AudioSource[] unitSources = site.Unit.GetComponentsInChildren<AudioSource>(true);
+            AudioSource[] unitSources = unit.GetComponentsInChildren<AudioSource>(true);
             for (int i = 0; i < unitSources.Length; i++)
             {
                 if (unitSources[i] != null && unitSources[i].outputAudioMixerGroup != null)
@@ -662,17 +855,13 @@ namespace MDSFramework.Wta
                 }
             }
 
-            Transform anchor = site.Rig != null && site.Rig.MuzzleTransform != null
-                ? site.Rig.MuzzleTransform
-                : site.Unit.transform;
-
             var audioGo = new GameObject("MDS_GunAudio");
             audioGo.transform.SetParent(anchor, false);
             audioGo.transform.localPosition = Vector3.zero;
             audioGo.transform.localRotation = Quaternion.identity;
 
-            float minDist = Mathf.Max(5f, site.Spec.GunFireAudioMinDistance);
-            float maxDist = Mathf.Max(200f, site.Spec.GunFireAudioMaxDistance);
+            float minDist = Mathf.Max(5f, spec.GunFireAudioMinDistance);
+            float maxDist = Mathf.Max(200f, spec.GunFireAudioMaxDistance);
             const int voiceCount = 4;
             var voices = new AudioSource[voiceCount];
             for (int i = 0; i < voiceCount; i++)
@@ -694,9 +883,66 @@ namespace MDSFramework.Wta
                 voices[i] = src;
             }
 
+            return voices;
+        }
+
+        private static AudioSource[]? EnsureGunAudioVoices(ModularSiteBehavior site)
+        {
+            if (site.Unit == null)
+            {
+                return null;
+            }
+
+            AudioSource[]? existing = site.GunAudioVoices;
+            if (existing != null && existing.Length > 0 && existing[0] != null)
+            {
+                return existing;
+            }
+
+            Transform anchor = site.Rig != null && site.Rig.MuzzleTransform != null
+                ? site.Rig.MuzzleTransform
+                : site.Unit.transform;
+            AudioSource[]? voices = EnsureGunAudioVoicesForUnit(site.Unit, anchor, site.Spec);
             site.GunAudioVoices = voices;
             site.GunAudioVoiceCursor = 0;
             return voices;
+        }
+
+        private static void PlayClientGunShot(
+            Unit unit,
+            ModularUnitSpec spec,
+            AudioClip clip,
+            float volume,
+            float pitchMin,
+            float pitchMax)
+        {
+            int key = unit.GetInstanceID();
+            if (!ClientAudioByInstanceId.TryGetValue(key, out ClientGunAudioState? state) ||
+                state.Voices == null || state.Voices.Length == 0 || state.Voices[0] == null)
+            {
+                MdsClientSiteProxy? proxy = unit.GetComponent<MdsClientSiteProxy>();
+                Transform anchor = proxy?.Rig?.MuzzleTransform != null ? proxy.Rig.MuzzleTransform : unit.transform;
+                AudioSource[]? voices = EnsureGunAudioVoicesForUnit(unit, anchor, spec);
+                state = new ClientGunAudioState { Voices = voices, Cursor = 0 };
+                ClientAudioByInstanceId[key] = state;
+            }
+
+            if (state.Voices == null || state.Voices.Length == 0)
+            {
+                return;
+            }
+
+            int idx = Math.Abs(state.Cursor++) % state.Voices.Length;
+            AudioSource voice = state.Voices[idx];
+            if (voice == null)
+            {
+                return;
+            }
+
+            voice.clip = clip;
+            voice.volume = volume;
+            voice.pitch = UnityEngine.Random.Range(pitchMin, pitchMax);
+            voice.Play();
         }
 
         private static void PlaySiteGunShot(

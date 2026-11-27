@@ -8,7 +8,7 @@ namespace MDSFramework.Patches
     {
         private static void Postfix(ARMSeeker __instance, Radar? __result)
         {
-            if (!MdsConfig.EnableAradAutoEmcon.Value || __instance == null)
+            if (!GameInteropHelpers.IsServerAuthority() || !MdsConfig.EnableAradAutoEmcon.Value || __instance == null)
             {
                 return;
             }

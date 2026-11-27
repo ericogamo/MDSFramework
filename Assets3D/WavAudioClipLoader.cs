@@ -30,11 +30,20 @@ namespace MDSFramework.Assets3D
 
             if (Cache.TryGetValue(normalized, out AudioClip? cached))
             {
-                return cached;
+                if (cached != null)
+                {
+                    return cached;
+                }
+
+                Cache.Remove(normalized);
             }
 
             AudioClip? clip = LoadFromDisk(normalized);
-            Cache[normalized] = clip;
+            if (clip != null)
+            {
+                Cache[normalized] = clip;
+            }
+
             return clip;
         }
 

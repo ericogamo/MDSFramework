@@ -300,6 +300,86 @@ namespace MDSFramework.Deployment
             return behavior;
         }
 
+        internal static MdsClientSiteProxy? AttachClientSiteRig(
+            Unit unit,
+            ContractorPackage package,
+            ModularUnitSpec spec,
+            bool startDeployed)
+        {
+            if (unit == null || package == null || spec == null)
+            {
+                return null;
+            }
+
+            MdsClientSiteProxy? existing = unit.GetComponent<MdsClientSiteProxy>();
+            if (existing != null)
+            {
+                return existing;
+            }
+
+            HideVanillaRenderers(unit.gameObject, preserveCargoChute: true);
+            DisableVanillaAutoWeapons(unit.gameObject, spec.Role);
+
+            GlbInstantiatedRig? rig = null;
+            GlbKeyframedAnimator? animator = null;
+            GlbTurretAimController? turretAim = null;
+
+            if (MdsConfig.EnableCustomGlbVisuals.Value)
+            {
+                string? glbPath = CustomMissileBehavior.ResolveAssetPath(package, spec.GlbRelativePath, spec.FallbackGlbRelativePaths);
+                string? decalPath = CustomMissileBehavior.ResolveAssetPath(package, spec.DecalRelativePath, Array.Empty<string>());
+
+                rig = GlbRuntimeLoader.Instantiate(
+                    spec.UnitId,
+                    glbPath,
+                    spec.FallbackMeshArchetype,
+                    decalPath,
+                    unit.transform,
+                    spec.ModelYawOffsetDeg);
+
+                if (rig != null)
+                {
+                    AlignAndBindVehicleRig(unit.gameObject, spec, rig);
+
+                    animator = rig.RootObject.GetComponent<GlbKeyframedAnimator>() ?? rig.RootObject.AddComponent<GlbKeyframedAnimator>();
+                    animator.Initialize(rig, spec.DeployDurationSeconds, startDeployed: startDeployed);
+
+                    Color beamColor = spec.Role == WeaponCascadeRole.LaserHel
+                        ? new Color(0.12f, 0.95f, 0.72f, 1f)
+                        : spec.Role == WeaponCascadeRole.CloseInGun
+                            ? new Color(1.0f, 0.72f, 0.20f, 1f)
+                            : new Color(0.25f, 0.85f, 1.0f, 1f);
+
+                    turretAim = rig.RootObject.GetComponent<GlbTurretAimController>() ?? rig.RootObject.AddComponent<GlbTurretAimController>();
+                    turretAim.Initialize(
+                        rig,
+                        animator,
+                        spec.TurretTraverseDegPerSec,
+                        spec.TurretElevationDegPerSec,
+                        spec.MinElevationDeg,
+                        spec.MaxElevationDeg,
+                        spec.SpinRadarDish,
+                        spec.RadarSpinDegPerSec,
+                        beamColor);
+                }
+            }
+
+            EnsureSelectableUnitCollider(unit, rig?.RootObject != null ? rig.RootObject.transform : null, spec);
+
+            MdsClientSiteProxy proxy = unit.gameObject.AddComponent<MdsClientSiteProxy>();
+            proxy.Initialize(unit, package, spec, rig, animator, turretAim, startDeployed);
+
+            if (GameManager.gameState != GameState.Editor && GameManager.gameState != GameState.Encyclopedia)
+            {
+                MdsDestructionManager.SuppressVanillaWreckage(unit);
+                MdsClientDestructionWatcher watcher = unit.GetComponent<MdsClientDestructionWatcher>()
+                    ?? unit.gameObject.AddComponent<MdsClientDestructionWatcher>();
+                watcher.Configure(unit, package, spec);
+            }
+
+            return proxy;
+        }
+
         internal static void AttachVisualPreviewRig(
             GameObject targetRoot,
             ContractorPackage package,
@@ -487,7 +567,30 @@ namespace MDSFramework.Deployment
             }
         }
 
-        private static void ConfigureRepairabilityAndMapIcon(Unit unit, ModularSiteBehavior behavior)
+        internal static void ConfigureBuildingClientFlagsPreStart(Building building)
+        {
+            if (building == null)
+            {
+                return;
+            }
+
+            if (GameInteropHelpers.BuildingRepairTimeField != null)
+            {
+                object? rawTime = GameInteropHelpers.BuildingRepairTimeField.GetValue(building);
+                float currentRepairTime = rawTime is float ft ? ft : 1000000f;
+                if (currentRepairTime >= 999999f)
+                {
+                    GameInteropHelpers.BuildingRepairTimeField.SetValue(building, 25f);
+                }
+            }
+
+            if (GameInteropHelpers.BuildingHideOnMapField != null)
+            {
+                GameInteropHelpers.BuildingHideOnMapField.SetValue(building, false);
+            }
+        }
+
+        internal static void ConfigureRepairabilityAndMapIcon(Unit unit, ModularSiteBehavior? behavior)
         {
             if (unit is Building building)
             {
@@ -572,8 +675,13 @@ namespace MDSFramework.Deployment
         {
             HideVanillaRenderers(unit.gameObject, preserveCargoChute: true);
             DisableVanillaAutoWeapons(unit.gameObject, spec.Role);
+            RemoveVanillaRearmer(unit, spec);
+        }
 
-            // Cloned HLT-L templates carry a vanilla Rearmer component; remove it so MDS trucks don't act as ammo trucks.
+        internal static void RemoveVanillaRearmer(Unit unit, ModularUnitSpec? spec)
+        {
+            _ = spec;
+            // Cloned HLT-L / MunitionsContainer templates carry a vanilla Rearmer component; remove it so MDS units don't act as ammo trucks.
             Rearmer[] strayRearmers = unit.GetComponentsInChildren<Rearmer>(true);
             for (int i = 0; i < strayRearmers.Length; i++)
             {
@@ -583,6 +691,8 @@ namespace MDSFramework.Deployment
                     continue;
                 }
 
+                stray.Capacity = 0f;
+                stray.AvailableForMission = false;
                 stray.enabled = false;
                 unit.NetworkHQ?.RearmMissionController?.DeregisterRearmer(stray);
                 UnityEngine.Object.Destroy(stray);
@@ -641,7 +751,7 @@ namespace MDSFramework.Deployment
             return false;
         }
 
-        private static void DisableVanillaAutoWeapons(GameObject root, WeaponCascadeRole role)
+        internal static void DisableVanillaAutoWeapons(GameObject root, WeaponCascadeRole role)
         {
             Gun[] guns = root.GetComponentsInChildren<Gun>(true);
             for (int i = 0; i < guns.Length; i++)

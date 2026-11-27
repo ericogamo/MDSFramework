@@ -16,14 +16,22 @@ namespace MDSFramework.Patches
 
         internal static bool IsInsideTakeDamage => takeDamageDepth > 0;
 
-        private static void Prefix()
+        private static bool Prefix(out bool __state)
         {
+            if (!GameInteropHelpers.IsServerAuthority())
+            {
+                __state = false;
+                return false;
+            }
+
             takeDamageDepth++;
+            __state = true;
+            return true;
         }
 
-        private static void Finalizer()
+        private static void Finalizer(bool __state)
         {
-            if (takeDamageDepth > 0)
+            if (__state && takeDamageDepth > 0)
             {
                 takeDamageDepth--;
             }
@@ -57,7 +65,7 @@ namespace MDSFramework.Patches
         private static bool Prefix(ARHSeeker __instance, Unit.JamEventArgs e, out bool __state)
         {
             __state = false;
-            if (__instance == null)
+            if (!GameInteropHelpers.IsServerAuthority() || __instance == null)
             {
                 return true;
             }

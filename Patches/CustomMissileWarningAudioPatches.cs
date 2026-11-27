@@ -36,6 +36,40 @@ namespace MDSFramework.Patches
 
         private static AudioClip? fallbackLoopClip;
         private static AudioClip? fallbackAlertClip;
+        private static readonly Dictionary<MissileWarning, float> NextExtendedCheckAt = new Dictionary<MissileWarning, float>();
+
+        internal static void ResetSession()
+        {
+            NextExtendedCheckAt.Clear();
+        }
+
+        internal static void Dispose()
+        {
+            ResetSession();
+            if (fallbackLoopClip != null)
+            {
+                UnityEngine.Object.Destroy(fallbackLoopClip);
+                fallbackLoopClip = null;
+            }
+
+            if (fallbackAlertClip != null)
+            {
+                UnityEngine.Object.Destroy(fallbackAlertClip);
+                fallbackAlertClip = null;
+            }
+        }
+
+        internal static bool ShouldRunExtendedRangeTick(MissileWarning warning)
+        {
+            float now = Time.unscaledTime;
+            if (NextExtendedCheckAt.TryGetValue(warning, out float nextAt) && now < nextAt)
+            {
+                return false;
+            }
+
+            NextExtendedCheckAt[warning] = now + 0.20f;
+            return true;
+        }
 
         internal static bool TryResolveCustomWarningSpec(
             Missile? missile,
@@ -246,6 +280,7 @@ namespace MDSFramework.Patches
         private readonly Dictionary<string, CustomAlarmChannel> channelsByMissileId =
             new Dictionary<string, CustomAlarmChannel>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<PersistentID, string> missileIdToChannelKey = new Dictionary<PersistentID, string>();
+        private readonly Dictionary<PersistentID, float> staleSinceByMissileId = new Dictionary<PersistentID, float>();
         private readonly List<PersistentID> pruneScratch = new List<PersistentID>(8);
 
         private Aircraft? aircraft;
@@ -298,6 +333,7 @@ namespace MDSFramework.Patches
 
             channel.ActiveIds.Add(id);
             missileIdToChannelKey[id] = channelKey;
+            staleSinceByMissileId.Remove(id);
 
             if (channel.Source != null)
             {
@@ -324,6 +360,7 @@ namespace MDSFramework.Patches
             }
 
             missileIdToChannelKey.Remove(persistentId);
+            staleSinceByMissileId.Remove(persistentId);
             if (channelsByMissileId.TryGetValue(channelKey, out CustomAlarmChannel? channel))
             {
                 channel.ActiveIds.Remove(persistentId);
@@ -347,6 +384,7 @@ namespace MDSFramework.Patches
 
             channelsByMissileId.Clear();
             missileIdToChannelKey.Clear();
+            staleSinceByMissileId.Clear();
             aircraft = null;
         }
 
@@ -373,10 +411,21 @@ namespace MDSFramework.Patches
             pruneScratch.Clear();
             foreach (PersistentID id in missileIdToChannelKey.Keys)
             {
-                if (!UnitRegistry.TryGetUnit(id, out Unit unit) ||
-                    unit is not Missile m ||
-                    m.disabled ||
-                    m.targetID != aircraft.persistentID)
+                bool stale = !UnitRegistry.TryGetUnit(id, out Unit unit) ||
+                             unit is not Missile m ||
+                             m.disabled ||
+                             m.targetID != aircraft.persistentID;
+                if (!stale)
+                {
+                    staleSinceByMissileId.Remove(id);
+                    continue;
+                }
+
+                if (!staleSinceByMissileId.TryGetValue(id, out float staleAt))
+                {
+                    staleSinceByMissileId[id] = now;
+                }
+                else if (now - staleAt >= 1.5f)
                 {
                     pruneScratch.Add(id);
                 }
@@ -576,7 +625,9 @@ namespace MDSFramework.Patches
             }
 
             if (CustomMissileWarningAudioLookup.MissileWarningAircraftField?.GetValue(__instance) is not Aircraft aircraft ||
-                aircraft.disabled)
+                aircraft.disabled ||
+                !GameManager.IsLocalAircraft(aircraft) ||
+                !CustomMissileWarningAudioLookup.ShouldRunExtendedRangeTick(__instance))
             {
                 return;
             }

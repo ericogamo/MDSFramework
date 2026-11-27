@@ -33,6 +33,11 @@ namespace MDSFramework.Api
 
             public bool TrySpendFactionCredits(FactionAffinity faction, float amount, string reason)
             {
+                if (!GameInteropHelpers.IsServerAuthority())
+                {
+                    return false;
+                }
+
                 bool freeSandbox = GameManager.gameState == GameState.SinglePlayer && MdsConfig.VanillaFreeSandboxSpawn.Value;
                 if (Mathf.Approximately(amount, 0f) || freeSandbox)
                 {

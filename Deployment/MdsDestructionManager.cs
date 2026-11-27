@@ -186,7 +186,7 @@ namespace MDSFramework.Deployment
                 unit.transform.rotation);
         }
 
-        private void HandleRepaired()
+        internal void HandleRepaired()
         {
             wreckSpawned = false;
             MdsDestructionManager.CleanupWreck(activeWreckRoot);
@@ -499,6 +499,7 @@ namespace MDSFramework.Deployment
 
                     GameObject debrisGo = UnityEngine.Object.Instantiate(srcChunk.gameObject);
                     debrisGo.name = $"MDS_Debris_{spec.UnitId}_{i + 1}";
+                    debrisGo.layer = PhysicsLayers.IgnoreCollisions;
                     if (parentOrigin != null)
                     {
                         debrisGo.transform.SetParent(parentOrigin, false);

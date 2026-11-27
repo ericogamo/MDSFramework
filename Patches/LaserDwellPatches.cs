@@ -17,7 +17,7 @@ namespace MDSFramework.Patches
         private static void Prefix(Laser __instance, out SavedLaserStats __state)
         {
             __state = default;
-            if (!MdsConfig.EnableLaserDwell.Value || __instance == null)
+            if (!GameInteropHelpers.IsServerAuthority() || !MdsConfig.EnableLaserDwell.Value || __instance == null)
             {
                 return;
             }
@@ -53,7 +53,7 @@ namespace MDSFramework.Patches
             }
         }
 
-        private static void Postfix(Laser __instance, SavedLaserStats __state)
+        private static void Finalizer(Laser __instance, SavedLaserStats __state)
         {
             if (!__state.Modified || __instance == null)
             {

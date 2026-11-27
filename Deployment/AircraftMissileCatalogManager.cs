@@ -25,32 +25,33 @@ namespace MDSFramework.Deployment
         private static readonly Dictionary<string, AirMissileCatalogEntry> EntriesByKey = new Dictionary<string, AirMissileCatalogEntry>(StringComparer.OrdinalIgnoreCase);
 
         private static GameObject? mountPrefabHolder;
-        private static bool subscribed;
 
         internal static int RegisteredMountCount { get { lock (SyncLock) { return EntriesByMount.Count; } } }
         internal static int InjectedHardpointCount { get; private set; }
 
         internal static void EnsureInitializedSubscription()
         {
-            if (subscribed)
-            {
-                return;
-            }
+            MdsCatalogCoordinator.Initialize();
+        }
 
-            subscribed = true;
-            ContractorRegistry.OnPackageRegistered += OnPackageRegistered;
+        internal static void Dispose()
+        {
         }
 
         internal static void EnsureRegisteredAll()
         {
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
+        }
+
+        internal static int EnsureRegisteredAllInternal(Encyclopedia enc)
+        {
             EnsureInitializedSubscription();
 
-            if (Encyclopedia.i == null || Encyclopedia.i.weaponMounts == null)
+            if (enc == null || enc.weaponMounts == null)
             {
-                return;
+                return 0;
             }
 
-            Encyclopedia enc = Encyclopedia.i;
             int newlyRegistered = 0;
 
             lock (SyncLock)
@@ -67,9 +68,12 @@ namespace MDSFramework.Deployment
                         continue;
                     }
 
-                    for (int m = 0; m < pkg.Missiles.Count; m++)
+                    var sortedMissiles = new List<CustomMissileSpec>(pkg.Missiles);
+                    sortedMissiles.Sort((a, b) => string.Compare(a?.MissileId, b?.MissileId, StringComparison.OrdinalIgnoreCase));
+
+                    for (int m = 0; m < sortedMissiles.Count; m++)
                     {
-                        CustomMissileSpec spec = pkg.Missiles[m];
+                        CustomMissileSpec spec = sortedMissiles[m];
                         if (spec == null ||
                             !spec.EnableAircraftMounting ||
                             string.IsNullOrWhiteSpace(spec.MissileId) ||
@@ -86,9 +90,10 @@ namespace MDSFramework.Deployment
 
             if (newlyRegistered > 0)
             {
-                MdsEncyclopediaCatalog.InvalidateMissionEditorCache();
                 MdsLog.Info($"[AirWeapons] Registered {RegisteredMountCount} aircraft missile mounts across {InjectedHardpointCount} hardpoint sets.");
             }
+
+            return newlyRegistered;
         }
 
         internal static bool TryResolveMount(WeaponMount? mount, out AirMissileCatalogEntry entry)
@@ -137,7 +142,7 @@ namespace MDSFramework.Deployment
 
         private static void OnPackageRegistered(ContractorPackage _)
         {
-            EnsureRegisteredAll();
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
         }
 
         private static int RegisterAircraftMountsForMissileLocked(
@@ -179,14 +184,23 @@ namespace MDSFramework.Deployment
                 return 0;
             }
 
+            matchedSourceMounts.Sort((a, b) =>
+            {
+                string ka = !string.IsNullOrEmpty(a.jsonKey) ? a.jsonKey : a.name;
+                string kb = !string.IsNullOrEmpty(b.jsonKey) ? b.jsonKey : b.name;
+                return string.Compare(ka, kb, StringComparison.OrdinalIgnoreCase);
+            });
+
             int added = 0;
             for (int i = 0; i < matchedSourceMounts.Count; i++)
             {
                 WeaponMount srcMount = matchedSourceMounts[i];
                 string suffix = !string.IsNullOrEmpty(srcMount.jsonKey) ? srcMount.jsonKey : srcMount.name;
                 string clonedKey = $"mds_air_{spec.MissileId}_{suffix}";
-                if (EntriesByKey.ContainsKey(clonedKey))
+                if (EntriesByKey.TryGetValue(clonedKey, out AirMissileCatalogEntry existing))
                 {
+                    RegisterWeaponMountInEncyclopedia(enc, existing.ClonedMount, clonedKey);
+                    InjectIntoCompatibleAircraft(enc, srcMount, existing.ClonedMount);
                     continue;
                 }
 

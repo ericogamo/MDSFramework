@@ -43,30 +43,31 @@ namespace MDSFramework.Deployment
 
         internal static void Initialize()
         {
+            MdsCatalogCoordinator.Initialize();
             if (!subscribedToRegistry)
             {
                 subscribedToRegistry = true;
-                ContractorRegistry.OnPackageRegistered += OnPackageRegistered;
             }
         }
 
         internal static void Dispose()
         {
-            if (subscribedToRegistry)
-            {
-                subscribedToRegistry = false;
-                ContractorRegistry.OnPackageRegistered -= OnPackageRegistered;
-            }
+            MdsCatalogCoordinator.Dispose();
+            subscribedToRegistry = false;
         }
 
         internal static void EnsureRegisteredAll()
         {
-            if (!MdsConfig.EnableMissionEditorCatalog.Value || Encyclopedia.i == null)
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
+        }
+
+        internal static int EnsureRegisteredAllInternal(Encyclopedia enc)
+        {
+            if (enc == null)
             {
-                return;
+                return 0;
             }
 
-            Encyclopedia enc = Encyclopedia.i;
             int newlyRegistered = 0;
 
             lock (SyncLock)
@@ -98,6 +99,7 @@ namespace MDSFramework.Deployment
 
                             if (UnitsByUnitId.TryGetValue(spec.UnitId, out MdsUnitCatalogEntry existing))
                             {
+                                existing.Definition.dontAutomaticallyAddToEncyclopedia = !MdsConfig.EnableMissionEditorCatalog.Value;
                                 EnsureUnitInEncyclopediaLocked(enc, existing.Definition, existing.JsonKey);
                                 continue;
                             }
@@ -124,6 +126,7 @@ namespace MDSFramework.Deployment
 
                             if (MissilesById.TryGetValue(mSpec.MissileId, out MdsMissileCatalogEntry existingM))
                             {
+                                existingM.Definition.dontAutomaticallyAddToEncyclopedia = !MdsConfig.EnableMissionEditorCatalog.Value;
                                 EnsureMissileInEncyclopediaLocked(enc, existingM.Definition, existingM.JsonKey);
                                 continue;
                             }
@@ -139,10 +142,11 @@ namespace MDSFramework.Deployment
 
             if (newlyRegistered > 0)
             {
-                InvalidateMissionEditorCache();
                 MdsLog.Info(
                     $"[Catalog] Registered {RegisteredUnitCount} modular units and {RegisteredMissileCount} missiles into Encyclopedia & Mission Editor.");
             }
+
+            return newlyRegistered;
         }
 
         internal static void InvalidateMissionEditorCache()
@@ -411,7 +415,7 @@ namespace MDSFramework.Deployment
 
         private static void OnPackageRegistered(ContractorPackage _)
         {
-            EnsureRegisteredAll();
+            MdsCatalogCoordinator.EnsureAllRegisteredCanonical();
         }
 
         private static bool RegisterUnitEntryLocked(Encyclopedia enc, ContractorPackage pkg, ModularUnitSpec spec)
@@ -437,7 +441,7 @@ namespace MDSFramework.Deployment
             {
                 clonedDef.spawnOffset = Vector3.zero;
             }
-            clonedDef.dontAutomaticallyAddToEncyclopedia = false;
+            clonedDef.dontAutomaticallyAddToEncyclopedia = !MdsConfig.EnableMissionEditorCatalog.Value;
 
             if (clonedDef is VehicleDefinition && spec.IsContainerHauler)
             {
@@ -479,6 +483,12 @@ namespace MDSFramework.Deployment
             UnitsByUnitId[spec.UnitId] = entry;
             UnitsByDefinition[clonedDef] = entry;
             UnitsByKey[jsonKey] = entry;
+            if (UnitsByDisplayName.TryGetValue(spec.DisplayName, out MdsUnitCatalogEntry existingDisplay) &&
+                !string.Equals(existingDisplay.Spec.UnitId, spec.UnitId, StringComparison.OrdinalIgnoreCase))
+            {
+                MdsLog.Warn($"[Catalog] DisplayName '{spec.DisplayName}' collides between '{existingDisplay.Spec.UnitId}' and '{spec.UnitId}'.");
+            }
+
             UnitsByDisplayName[spec.DisplayName] = entry;
             UnitsByDisplayName[clonedDef.unitName] = entry;
             RegisteredUnitCount = UnitsByUnitId.Count;
@@ -504,7 +514,7 @@ namespace MDSFramework.Deployment
             clonedMissile.jsonKey = jsonKey;
             clonedMissile.unitName = spec.DisplayName;
             clonedMissile.description = BuildMissileDescription(pkg, spec);
-            clonedMissile.dontAutomaticallyAddToEncyclopedia = false;
+            clonedMissile.dontAutomaticallyAddToEncyclopedia = !MdsConfig.EnableMissionEditorCatalog.Value;
 
             GameInteropHelpers.UnitDefinitionDisabledField?.SetValue(clonedMissile, false);
             GameInteropHelpers.UnitDefinitionEventField?.SetValue(clonedMissile, false);
@@ -522,6 +532,12 @@ namespace MDSFramework.Deployment
             MissilesById[spec.MissileId] = entry;
             MissilesByDefinition[clonedMissile] = entry;
             MissilesByKey[jsonKey] = entry;
+            if (MissilesByDisplayName.TryGetValue(spec.DisplayName, out MdsMissileCatalogEntry existingDisplayM) &&
+                !string.Equals(existingDisplayM.Spec.MissileId, spec.MissileId, StringComparison.OrdinalIgnoreCase))
+            {
+                MdsLog.Warn($"[Catalog] Missile DisplayName '{spec.DisplayName}' collides between '{existingDisplayM.Spec.MissileId}' and '{spec.MissileId}'.");
+            }
+
             MissilesByDisplayName[spec.DisplayName] = entry;
             MissilesByDisplayName[$"[MDS] {spec.DisplayName}"] = entry;
             RegisteredMissileCount = MissilesById.Count;

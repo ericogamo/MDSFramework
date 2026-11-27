@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using MDSFramework.Api;
 using MDSFramework.Missiles;
+using MDSFramework.Networking;
 using MDSFramework.Sensors;
 using UnityEngine;
 
@@ -2503,11 +2504,13 @@ namespace MDSFramework.Wta
             }
 
             site.TurretAim?.ShowBeamOrTracer(th.WorldPos, actualDt + 0.12f, 0.085f);
+            MdsNetworkSync.BroadcastHelBeam(site, th.WorldPos, actualDt + 0.12f, 0.085f);
 
             if (!target.persistentID.Equals(site.ActiveHelTargetId))
             {
                 site.ActiveHelTargetId = target.persistentID;
                 site.ActiveHelDwellSeconds = 0f;
+                return;
             }
 
             site.ActiveHelDwellSeconds += actualDt;
@@ -2583,6 +2586,7 @@ namespace MDSFramework.Wta
                 : site.Unit.transform.forward;
             Vector3 flashEnd = muzzlePos + (dir * Mathf.Min(18f, dist));
             site.TurretAim?.ShowBeamOrTracer(flashEnd, 0.06f, 0.07f);
+            MdsNetworkSync.BroadcastHelBeam(site, flashEnd, 0.06f, 0.07f);
 
             AheadAirburstManager.FireProgrammedBurst(
                 site,

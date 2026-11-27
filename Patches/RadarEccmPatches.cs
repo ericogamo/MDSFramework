@@ -10,7 +10,7 @@ namespace MDSFramework.Patches
     {
         private static void Postfix(Unit __instance, Unit.JamEventArgs args)
         {
-            if (!MdsConfig.EnableEccmNetwork.Value)
+            if (!GameInteropHelpers.IsServerAuthority() || !MdsConfig.EnableEccmNetwork.Value)
             {
                 return;
             }
@@ -39,21 +39,36 @@ namespace MDSFramework.Patches
             }
 
             ModularSiteBehavior? site = owner.GetComponent<ModularSiteBehavior>();
-            if (site == null || site.Spec.SensorProfile == null)
+            if (site != null && site.Spec.SensorProfile != null)
             {
+                // Active EMCON or stowed radar ignores jamming accumulation completely.
+                if (!site.IsRadarEmitting)
+                {
+                    return false;
+                }
+
+                float tol = Mathf.Clamp(site.Spec.SensorProfile.JamTolerance + site.EffectiveNetworkEccmBonus, 0f, 0.92f);
+                if (tol > 0.05f)
+                {
+                    e.jamAmount *= Mathf.Clamp(1f - (tol * 0.75f), 0.08f, 1f);
+                }
+
                 return true;
             }
 
-            // Active EMCON or stowed radar ignores jamming accumulation completely.
-            if (!site.IsRadarEmitting)
+            MdsClientSiteProxy? proxy = owner.GetComponent<MdsClientSiteProxy>();
+            if (proxy != null && proxy.Spec.SensorProfile != null)
             {
-                return false;
-            }
+                if (!proxy.IsRadarEmitting)
+                {
+                    return false;
+                }
 
-            float tol = Mathf.Clamp(site.Spec.SensorProfile.JamTolerance + site.EffectiveNetworkEccmBonus, 0f, 0.92f);
-            if (tol > 0.05f)
-            {
-                e.jamAmount *= Mathf.Clamp(1f - (tol * 0.75f), 0.08f, 1f);
+                float tol = Mathf.Clamp(proxy.Spec.SensorProfile.JamTolerance, 0f, 0.92f);
+                if (tol > 0.05f)
+                {
+                    e.jamAmount *= Mathf.Clamp(1f - (tol * 0.75f), 0.08f, 1f);
+                }
             }
 
             return true;

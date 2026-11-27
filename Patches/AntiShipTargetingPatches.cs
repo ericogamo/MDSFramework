@@ -86,15 +86,9 @@ namespace MDSFramework.Patches
             }
 
             List<Unit>? targets = __instance.GetTargetList();
-            if (targets != null)
+            if (targets != null && targets.Count > 0 && AntiShipTargetingPatches.IsValidAntiShipTarget(targets[0]))
             {
-                for (int i = 0; i < targets.Count; i++)
-                {
-                    if (AntiShipTargetingPatches.IsValidAntiShipTarget(targets[i]))
-                    {
-                        return true;
-                    }
-                }
+                return true;
             }
 
             Unit? owner = GameInteropHelpers.WeaponManagerAircraftField?.GetValue(__instance) as Unit;
@@ -146,11 +140,19 @@ namespace MDSFramework.Patches
         new[] { typeof(Unit), typeof(Unit) })]
     internal static class WeaponStationFireAntiShipPatch
     {
-        private static bool Prefix(WeaponStation __instance, Unit target)
+        private static bool Prefix(WeaponStation __instance, Unit owner, Unit target)
         {
             if (__instance == null ||
                 __instance.WeaponInfo == null ||
                 !ContractorRegistry.IsAntiShipWeaponInfo(__instance.WeaponInfo))
+            {
+                return true;
+            }
+
+            if (owner != null &&
+                !owner.IsServer &&
+                !owner.HasAuthority &&
+                GameManager.gameState != GameState.SinglePlayer)
             {
                 return true;
             }

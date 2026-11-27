@@ -1,6 +1,7 @@
 using System.Diagnostics.CodeAnalysis;
 using BepInEx;
 using HarmonyLib;
+using MDSFramework.Networking;
 
 namespace MDSFramework
 {
@@ -24,6 +25,8 @@ namespace MDSFramework
                 MdsLog.Info($"{MdsPluginInfo.Name} {MdsPluginInfo.Version} is disabled in config.");
                 return;
             }
+
+            MdsNetworkSync.Initialize();
 
             harmony = new Harmony(MdsPluginInfo.Guid);
             harmony.PatchAll();

@@ -3,6 +3,7 @@ using HarmonyLib;
 using MDSFramework.Api;
 using MDSFramework.Deployment;
 using MDSFramework.Missiles;
+using MDSFramework.Sensors;
 using Mirage;
 using NuclearOption.MissionEditorScripts.Buttons;
 using NuclearOption.Networking;
@@ -65,6 +66,11 @@ namespace MDSFramework.Patches
             {
                 Stack.Pop();
             }
+        }
+
+        internal static void Clear()
+        {
+            Stack.Clear();
         }
 
         internal static bool TryPeek(out PendingMdsSpawnContext ctx)
@@ -281,7 +287,7 @@ namespace MDSFramework.Patches
 
         internal static void ApplyClientVisualSync(Unit? unit)
         {
-            if (unit == null || unit.IsServer || unit.disabled)
+            if (unit == null || unit.IsServer)
             {
                 return;
             }
@@ -294,13 +300,25 @@ namespace MDSFramework.Patches
                     out bool isCargo))
             {
                 unit.definition = def;
-                ModularSiteManager.AttachVisualPreviewRig(
-                    unit.gameObject,
+                ModularSiteManager.RemoveVanillaRearmer(unit, spec);
+                ModularSiteManager.ConfigureRepairabilityAndMapIcon(unit, null);
+                MdsClientSiteProxy? proxy = ModularSiteManager.AttachClientSiteRig(
+                    unit,
                     pkg,
                     spec,
-                    startDeployed: !isCargo,
-                    attachClientRadarSpin: true);
-                MdsWeaponStationBuilder.ApplyWeaponStations(unit, pkg, spec, site: null);
+                    startDeployed: !isCargo && ModularSiteManager.ShouldStartDeployed(spec));
+                MdsWeaponStationBuilder.ApplyWeaponStations(unit, pkg, spec, site: null, clientProxy: proxy);
+
+                if (unit.disabled)
+                {
+                    Transform? intactRig = unit.transform.Find($"MDS_Rig_{spec.UnitId}");
+                    if (intactRig != null)
+                    {
+                        intactRig.gameObject.SetActive(false);
+                    }
+
+                    ModularSiteManager.ReapplyHiddenVanillaVisuals(unit);
+                }
             }
         }
 
@@ -346,7 +364,9 @@ namespace MDSFramework.Patches
 
             if (ctx.UnitSpec != null)
             {
-                unit.NetworkunitName = ctx.UnitSpec.DisplayName;
+                unit.NetworkunitName = ctx.IsCargoContainer
+                    ? $"[MDS Cargo] {ctx.UnitSpec.DisplayName}"
+                    : ctx.UnitSpec.DisplayName;
                 unit.RCS = Mathf.Max(0.02f, ctx.UnitSpec.StowedRcs);
             }
             else if (ctx.MissileSpec != null)
@@ -563,9 +583,36 @@ namespace MDSFramework.Patches
     [HarmonyPatch(typeof(Building), "OnStartClient")]
     internal static class BuildingMdsClientVisualPatch
     {
+        private static void Prefix(Building __instance)
+        {
+            if (__instance == null || __instance.IsServer)
+            {
+                return;
+            }
+
+            if (MdsEncyclopediaCatalog.TryResolveUnitByDisplayName(__instance.unitName, out _, out _, out _, out _))
+            {
+                ModularSiteManager.ConfigureBuildingClientFlagsPreStart(__instance);
+            }
+        }
+
         private static void Postfix(Building __instance)
         {
             MissionEditorPatchHelpers.ApplyClientVisualSync(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(Building), nameof(Building.UnitDisabled), new[] { typeof(bool), typeof(bool) })]
+    internal static class BuildingUnitDisabledClientRepairPatch
+    {
+        private static void Postfix(Building __instance, bool oldState, bool newState)
+        {
+            if (__instance == null || __instance.IsServer || !(oldState && !newState))
+            {
+                return;
+            }
+
+            __instance.GetComponent<MdsClientDestructionWatcher>()?.HandleRepaired();
         }
     }
 

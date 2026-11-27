@@ -395,6 +395,7 @@ namespace MDSFramework.Assets3D
             }
 
             ExternalTextureCache.Clear();
+            encyclopediaTemplate = null;
         }
 
         private static Texture2D? LoadAndConvertLinearRgba32(
