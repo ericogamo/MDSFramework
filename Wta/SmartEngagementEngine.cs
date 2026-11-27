@@ -2787,7 +2787,7 @@ namespace MDSFramework.Wta
                 burstRounds);
         }
 
-        private static void ExecuteMissileOrder(
+        private static bool ExecuteMissileOrder(
             ModularSiteBehavior site,
             Unit target,
             bool usePassiveHoj,
@@ -2795,7 +2795,7 @@ namespace MDSFramework.Wta
         {
             if (site.CooldownRemaining > 0f || site.AmmoRemaining <= 0 || Spawner.i == null || GameInteropHelpers.IsAircraftSplashed(target))
             {
-                return;
+                return false;
             }
 
             bool hasSecondary = useSecondaryMissile && site.SecondaryAmmoRemaining > 0 && !string.IsNullOrEmpty(site.Spec.SecondaryMissileId);
@@ -2807,7 +2807,7 @@ namespace MDSFramework.Wta
                 (!hasSecondary && site.PrimaryAmmoRemaining <= 0) ||
                 !ContractorRegistry.TryGetMissileSpec(missileId, out ContractorPackage pkg, out CustomMissileSpec missileSpec))
             {
-                return;
+                return false;
             }
 
             if (!site.Spec.VerticalLaunch && !site.Spec.LaunchAlongSocketForward)
@@ -2815,14 +2815,14 @@ namespace MDSFramework.Wta
                 site.TurretAim?.SetAimWorldPosition(target.transform.position);
                 if (site.TurretAim != null && !site.TurretAim.IsOnTarget)
                 {
-                    return;
+                    return false;
                 }
             }
 
-            if ((site.EmconState == FcuEmconState.EoIrEmergencyOnly || site.Spec.LaunchAlongSocketForward) &&
+            if (((site.EmconState == FcuEmconState.EoIrEmergencyOnly && !usePassiveHoj) || site.Spec.LaunchAlongSocketForward) &&
                 Physics.Linecast(GetMuzzleOrigin(site), GetTargetAimPosition(target), (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
             {
-                return;
+                return false;
             }
 
             MissileDefinition? baseDef = GameInteropHelpers.ResolveEncyclopediaMissileDef(
@@ -2832,7 +2832,7 @@ namespace MDSFramework.Wta
                     (missileSpec.IsAbmInterceptor || missileSpec.MaxEngagementRangeKm >= 20f));
             if (baseDef == null || baseDef.unitPrefab == null)
             {
-                return;
+                return false;
             }
 
             bool reservedAbm = false;
@@ -2840,7 +2840,7 @@ namespace MDSFramework.Wta
             {
                 if (!RtsBridgeHost.Current.AbmStockpile.TryReserveAbmInterceptor(site.Faction, missileSpec.MissileId))
                 {
-                    return;
+                    return false;
                 }
 
                 reservedAbm = true;
@@ -2878,6 +2878,8 @@ namespace MDSFramework.Wta
                 {
                     MdsLog.Info($"[HOJ BLIND LAUNCH] '{site.SiteId}' launched '{missileSpec.DisplayName}' -> '{target.unitName}'.");
                 }
+
+                return true;
             }
             else if (reservedAbm)
             {
@@ -2890,6 +2892,151 @@ namespace MDSFramework.Wta
                     vb.RefundAbmInterceptor(site.Faction);
                 }
             }
+
+            return false;
+        }
+
+        internal static bool TryExecuteManualFireOrder(ModularSiteBehavior site, Unit target, bool useSecondarySlot)
+        {
+            if (!GameInteropHelpers.IsServerAuthority() ||
+                site == null ||
+                !site.IsAlive ||
+                site.SuspendedInTransit ||
+                site.IsVehicleMoving ||
+                site.IsHoldFireActive ||
+                target == null ||
+                target.disabled ||
+                GameInteropHelpers.IsAircraftSplashed(target))
+            {
+                return false;
+            }
+
+            site.LastThreatSeenTime = Time.time;
+
+            if (!site.IsDeployed || site.CooldownRemaining > 0.01f)
+            {
+                site.QueueManualFire(target, useSecondarySlot);
+                return false;
+            }
+
+            WeaponCascadeRole role = site.Spec.Role;
+            if (role == WeaponCascadeRole.ShortMedSam ||
+                role == WeaponCascadeRole.LongRangeSam ||
+                role == WeaponCascadeRole.AbmVls ||
+                role == WeaponCascadeRole.AntiShipCoastal ||
+                role == WeaponCascadeRole.AntiVehicleDrone)
+            {
+                int slotAmmo = useSecondarySlot ? site.SecondaryAmmoRemaining : site.PrimaryAmmoRemaining;
+                string missileId = useSecondarySlot ? site.Spec.SecondaryMissileId : site.Spec.PrimaryMissileId;
+                if (slotAmmo <= 0 ||
+                    string.IsNullOrEmpty(missileId) ||
+                    !ContractorRegistry.TryGetMissileSpec(missileId, out _, out CustomMissileSpec missileSpec))
+                {
+                    return false;
+                }
+
+                if (missileSpec.IsAntiShip && target is not Ship)
+                {
+                    return false;
+                }
+
+                if (missileSpec.IsAntiVehicle && target is not GroundVehicle)
+                {
+                    return false;
+                }
+
+                float maxRangeM = Mathf.Max(site.Spec.MaxEngagementRangeKm, missileSpec.MaxEngagementRangeKm) * 1000f * 1.05f;
+                Vector3 sitePos = site.Unit != null ? site.Unit.transform.position : site.transform.position;
+                Vector3 targetPos = GetTargetAimPosition(target);
+                if ((targetPos - sitePos).sqrMagnitude > maxRangeM * maxRangeM)
+                {
+                    return false;
+                }
+
+                bool usePassiveHoj = missileSpec.SupportsActiveToPassiveHoj ||
+                                     (SensorNetworkManager.Instance != null &&
+                                      SensorNetworkManager.Instance.IsUnitActivelyEmittingEcm(target));
+
+                if (!site.Spec.VerticalLaunch && !site.Spec.LaunchAlongSocketForward && site.TurretAim != null)
+                {
+                    site.TurretAim.SetAimWorldPosition(targetPos);
+                    if (!site.TurretAim.IsOnTarget)
+                    {
+                        site.QueueManualFire(target, useSecondarySlot, 6f);
+                        return false;
+                    }
+                }
+
+                int ammoBefore = site.AmmoRemaining;
+                bool launched = ExecuteMissileOrder(site, target, usePassiveHoj, useSecondarySlot) ||
+                                site.AmmoRemaining < ammoBefore;
+                if (launched)
+                {
+                    MdsLog.Info($"[Manual FIRE] '{site.SiteId}' launched '{missileSpec.DisplayName}' -> '{target.unitName}' (passiveHoj={usePassiveHoj}).");
+                }
+
+                return launched;
+            }
+
+            if (role == WeaponCascadeRole.CloseInGun)
+            {
+                if (site.PrimaryAmmoRemaining <= 0 || site.Unit == null)
+                {
+                    return false;
+                }
+
+                Vector3 aimPos = GetTargetAimPosition(target);
+                float maxRangeM = Mathf.Max(1000f, site.Spec.MaxEngagementRangeKm * 1000f) * 1.05f;
+                if ((aimPos - site.Unit.transform.position).sqrMagnitude > maxRangeM * maxRangeM ||
+                    Physics.Linecast(GetMuzzleOrigin(site), aimPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+                {
+                    return false;
+                }
+
+                Vector3 vel = target.rb != null ? target.rb.velocity : Vector3.zero;
+                var th = new ThreatSnapshot
+                {
+                    UnitId = target.persistentID,
+                    WorldPos = aimPos,
+                    Velocity = vel,
+                    AltitudeMeters = aimPos.y - Datum.LocalSeaY,
+                    IsNuclear = false
+                };
+
+                if (site.TurretAim != null)
+                {
+                    site.TurretAim.SetAimWorldPosition(aimPos);
+                    if (!site.TurretAim.IsOnTarget)
+                    {
+                        site.QueueManualFire(target, useSecondarySlot, 6f);
+                        return false;
+                    }
+                }
+
+                ExecuteGunCiwsOrder(site, target, ref th);
+                return site.CooldownRemaining > 0f;
+            }
+
+            if (role == WeaponCascadeRole.LaserHel)
+            {
+                if (site.Unit == null)
+                {
+                    return false;
+                }
+
+                Vector3 aimPos = GetTargetAimPosition(target);
+                float maxRangeM = Mathf.Max(1000f, site.Spec.MaxEngagementRangeKm * 1000f) * 1.05f;
+                if ((aimPos - site.Unit.transform.position).sqrMagnitude > maxRangeM * maxRangeM ||
+                    Physics.Linecast(GetMuzzleOrigin(site), aimPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+                {
+                    return false;
+                }
+
+                site.TurretAim?.SetAimWorldPosition(aimPos);
+                return true;
+            }
+
+            return false;
         }
 
         private void ClearIdleEffectors(int effectorCount)

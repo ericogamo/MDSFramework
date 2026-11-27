@@ -137,6 +137,34 @@ namespace MDSFramework.Deployment
             return 0f;
         }
 
+        public override void Fire(Unit owner, Unit target, Vector3 inheritedVelocity, WeaponStation weaponStation, GlobalPosition aimpoint)
+        {
+            if (weaponStation != null)
+            {
+                this.weaponStation = weaponStation;
+            }
+
+            if (!GameInteropHelpers.IsServerAuthority() || site == null || !site.IsAlive || target == null || target.disabled)
+            {
+                return;
+            }
+
+            bool fired = MDSFramework.Wta.SmartEngagementEngine.TryExecuteManualFireOrder(site, target, isSecondarySlot);
+            lastFired = Time.timeSinceLevelLoad;
+            if (this.weaponStation != null)
+            {
+                this.weaponStation.LastFiredTime = lastFired;
+            }
+
+            SyncToStation();
+            this.weaponStation?.Updated();
+
+            if (!fired && site.HasPendingManualFire)
+            {
+                MdsLog.Info($"[Manual FIRE] '{site.SiteId}' deploying/slewing for '{info?.weaponName}' -> '{target.unitName}'.");
+            }
+        }
+
         public override void Rearm(int ammoToRearm, WeaponStation station)
         {
             weaponStation = station;

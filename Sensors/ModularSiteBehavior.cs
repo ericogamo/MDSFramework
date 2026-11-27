@@ -61,6 +61,13 @@ namespace MDSFramework.Sensors
         internal float CooldownRemaining;
         internal float LastThreatSeenTime;
         internal bool PopUpRequested;
+        internal Unit? PendingManualFireTarget;
+        internal bool PendingManualFireSecondary;
+        internal float PendingManualFireExpiresAt;
+        internal bool HasPendingManualFire =>
+            PendingManualFireTarget != null &&
+            !PendingManualFireTarget.disabled &&
+            Time.time <= PendingManualFireExpiresAt;
 
         internal PersistentID ActiveHelTargetId;
         internal float ActiveHelDwellSeconds;
@@ -139,11 +146,32 @@ namespace MDSFramework.Sensors
             LocalHoldFire = holdFire;
             if (holdFire)
             {
+                ClearPendingManualFire();
                 TurretAim?.ClearAim();
                 TurretAim?.HideBeam();
                 ActiveHelTargetId = default;
                 ActiveHelDwellSeconds = 0f;
             }
+        }
+
+        internal void QueueManualFire(Unit target, bool useSecondarySlot, float timeoutSeconds = 12f)
+        {
+            if (target == null || target.disabled)
+            {
+                return;
+            }
+
+            PendingManualFireTarget = target;
+            PendingManualFireSecondary = useSecondarySlot;
+            PendingManualFireExpiresAt = Time.time + timeoutSeconds;
+            LastThreatSeenTime = Time.time;
+            RequestDeployState(true);
+        }
+
+        internal void ClearPendingManualFire()
+        {
+            PendingManualFireTarget = null;
+            PendingManualFireExpiresAt = 0f;
         }
 
         internal void SyncWeaponStationsAmmo()
@@ -432,6 +460,35 @@ namespace MDSFramework.Sensors
             if (CurrentJamLevel > 0f && Time.time - LastJamTime > 2.0f)
             {
                 CurrentJamLevel = Mathf.Max(0f, CurrentJamLevel - (deltaTime * 0.45f));
+            }
+
+            if (HasPendingManualFire)
+            {
+                if (IsHoldFireActive ||
+                    IsVehicleMoving ||
+                    SuspendedInTransit ||
+                    PendingManualFireTarget == null ||
+                    PendingManualFireTarget.disabled ||
+                    GameInteropHelpers.IsAircraftSplashed(PendingManualFireTarget))
+                {
+                    ClearPendingManualFire();
+                }
+                else
+                {
+                    PopUpRequested = true;
+                    LastThreatSeenTime = Time.time;
+                    if (IsDeployed && CooldownRemaining <= 0.01f)
+                    {
+                        bool fired = MDSFramework.Wta.SmartEngagementEngine.TryExecuteManualFireOrder(
+                            this,
+                            PendingManualFireTarget,
+                            PendingManualFireSecondary);
+                        if (fired || Time.time >= PendingManualFireExpiresAt)
+                        {
+                            ClearPendingManualFire();
+                        }
+                    }
+                }
             }
 
             bool deployDesired = IsCommandCenter
@@ -834,6 +891,7 @@ namespace MDSFramework.Sensors
 
         private void OnUnitDisabled(Unit disabledUnit)
         {
+            ClearPendingManualFire();
             TurretAim?.ClearAim();
             TurretAim?.HideBeam();
             ActiveHelTargetId = default;

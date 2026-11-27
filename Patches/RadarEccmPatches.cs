@@ -22,6 +22,23 @@ namespace MDSFramework.Patches
         }
     }
 
+    [HarmonyPatch(typeof(Unit), nameof(Unit.RpcJam))]
+    internal static class UnitRpcJamPatch
+    {
+        private static void Postfix(Unit __instance, Unit.JamEventArgs args)
+        {
+            if (!GameInteropHelpers.IsServerAuthority() || !MdsConfig.EnableEccmNetwork.Value)
+            {
+                return;
+            }
+
+            if (__instance != null && args.jammingUnit != null)
+            {
+                SensorNetworkManager.Instance?.NotifyJammingEmission(__instance, args.jammingUnit, args.jamAmount);
+            }
+        }
+    }
+
     [HarmonyPatch(typeof(Aircraft), nameof(Aircraft.AddECMIntensity), new[] { typeof(float) })]
     internal static class AircraftAddEcmIntensityPatch
     {
@@ -45,7 +62,7 @@ namespace MDSFramework.Patches
     [HarmonyPatch(typeof(Radar), "Radar_OnJam")]
     internal static class RadarOnJamPatch
     {
-        private static bool Prefix(Radar __instance)
+        private static bool Prefix(Radar __instance, Unit.JamEventArgs e)
         {
             if (!MdsConfig.EnableEccmNetwork.Value || __instance == null)
             {
@@ -56,6 +73,11 @@ namespace MDSFramework.Patches
             if (owner == null)
             {
                 return true;
+            }
+
+            if (GameInteropHelpers.IsServerAuthority() && e.jammingUnit != null)
+            {
+                SensorNetworkManager.Instance?.NotifyJammingEmission(owner, e.jammingUnit, e.jamAmount);
             }
 
             ModularSiteBehavior? site = owner.GetComponent<ModularSiteBehavior>();

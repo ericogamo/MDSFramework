@@ -34,6 +34,7 @@ namespace MDSFramework.Sensors
         private readonly List<ModularSiteBehavior> allSites = new List<ModularSiteBehavior>(32);
         private readonly List<HojTrackEntry> activeHojTracks = new List<HojTrackEntry>(16);
         private readonly Dictionary<Unit, float> lastPassiveEcmPulseTime = new Dictionary<Unit, float>();
+        private readonly Dictionary<long, int> lastJamNotifiedFrame = new Dictionary<long, int>(32);
         private readonly List<Unit> stalePulseScratch = new List<Unit>(16);
         private readonly List<ModularSiteBehavior> scratchFcus = new List<ModularSiteBehavior>(16);
         private readonly List<ModularSiteBehavior> scratchEffectors = new List<ModularSiteBehavior>(32);
@@ -114,6 +115,7 @@ namespace MDSFramework.Sensors
             allSites.Clear();
             activeHojTracks.Clear();
             lastPassiveEcmPulseTime.Clear();
+            lastJamNotifiedFrame.Clear();
             stalePulseScratch.Clear();
             scratchFcus.Clear();
             scratchEffectors.Clear();
@@ -230,6 +232,35 @@ namespace MDSFramework.Sensors
             lastPassiveEcmPulseTime[unit] = Time.time;
         }
 
+        internal static bool HasActiveJammingPod(Unit? unit)
+        {
+            if (unit == null || unit.disabled || unit.weaponStations == null)
+            {
+                return false;
+            }
+
+            List<WeaponStation> stations = unit.weaponStations;
+            for (int s = 0; s < stations.Count; s++)
+            {
+                WeaponStation? station = stations[s];
+                if (station == null || station.Weapons == null)
+                {
+                    continue;
+                }
+
+                List<Weapon> weapons = station.Weapons;
+                for (int w = 0; w < weapons.Count; w++)
+                {
+                    if (weapons[w] is JammingPod pod && pod.enabled)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
         internal bool IsUnitActivelyEmittingEcm(Unit? unit, float maxJamPodAgeSeconds = 3.5f)
         {
             if (unit == null || unit.disabled || GameInteropHelpers.IsAircraftSplashed(unit))
@@ -239,6 +270,12 @@ namespace MDSFramework.Sensors
 
             if (unit is Aircraft ac && ac.GetECMIntensity() > 0.05f)
             {
+                return true;
+            }
+
+            if (HasActiveJammingPod(unit))
+            {
+                RecordPassiveEcmPulse(unit);
                 return true;
             }
 
@@ -257,6 +294,20 @@ namespace MDSFramework.Sensors
             {
                 return;
             }
+
+            long frameKey = ((long)(uint)victim.GetInstanceID() << 32) | (uint)jammer.GetInstanceID();
+            int currentFrame = Time.frameCount;
+            if (lastJamNotifiedFrame.TryGetValue(frameKey, out int prevFrame) && prevFrame == currentFrame)
+            {
+                return;
+            }
+
+            if (lastJamNotifiedFrame.Count > 256)
+            {
+                lastJamNotifiedFrame.Clear();
+            }
+
+            lastJamNotifiedFrame[frameKey] = currentFrame;
 
             ModularSiteBehavior? victimSite = null;
             for (int i = 0; i < allSites.Count; i++)
@@ -328,7 +379,8 @@ namespace MDSFramework.Sensors
                 }
 
                 float maxRangeM = Mathf.Max(80000f, site.Spec.SensorProfile.DetectionRangeKm * 1500f);
-                Vector3 siteEye = site.Unit.transform.position + (Vector3.up * 3f);
+                Transform? scanTf = site.NativeRadar != null ? site.NativeRadar.GetScanPoint() : null;
+                Vector3 siteEye = scanTf != null ? scanTf.position : (site.Unit.transform.position + (Vector3.up * 6f));
                 if ((site.Unit.transform.position - jammerPos).sqrMagnitude <= maxRangeM * maxRangeM &&
                     !Physics.Linecast(siteEye, jammerPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                 {
@@ -336,7 +388,7 @@ namespace MDSFramework.Sensors
                 }
             }
 
-            if (victimSite != null && victimSite.IsRadarEmitting)
+            if (jamAmount > 0.001f || (victimSite != null && victimSite.IsRadarEmitting))
             {
                 observers = Math.Max(observers, 1);
             }
@@ -453,8 +505,15 @@ namespace MDSFramework.Sensors
                     continue;
                 }
 
-                bool hasPassivePulse = lastPassiveEcmPulseTime.TryGetValue(ac, out float pulseTime) &&
-                                       (now - pulseTime) <= PassiveEcmLatchSeconds;
+                bool hasActivePod = HasActiveJammingPod(ac);
+                if (hasActivePod)
+                {
+                    RecordPassiveEcmPulse(ac);
+                }
+
+                bool hasPassivePulse = hasActivePod ||
+                                       (lastPassiveEcmPulseTime.TryGetValue(ac, out float pulseTime) &&
+                                        (now - pulseTime) <= PassiveEcmLatchSeconds);
                 if (ac.GetECMIntensity() <= 0.15f && !hasPassivePulse)
                 {
                     continue;
@@ -510,7 +569,8 @@ namespace MDSFramework.Sensors
                 }
 
                 float maxRangeM = Mathf.Max(75000f, site.Spec.SensorProfile.DetectionRangeKm * 1500f);
-                Vector3 siteEye = site.Unit.transform.position + (Vector3.up * 3f);
+                Transform? scanTf = site.NativeRadar != null ? site.NativeRadar.GetScanPoint() : null;
+                Vector3 siteEye = scanTf != null ? scanTf.position : (site.Unit.transform.position + (Vector3.up * 6f));
                 if ((site.Unit.transform.position - acPos).sqrMagnitude <= maxRangeM * maxRangeM &&
                     !Physics.Linecast(siteEye, acPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                 {
