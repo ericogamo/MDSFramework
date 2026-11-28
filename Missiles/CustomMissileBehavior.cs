@@ -557,9 +557,7 @@ namespace MDSFramework.Missiles
                         burnRateField.GetValue(motorObj) is float br && br > 0f &&
                         fuelMassField.GetValue(motorObj) is float fm && fm > 0f)
                     {
-                        float newFm = Mathf.Max(1f, fm * scale);
-                        fuelMassField.SetValue(motorObj, newFm);
-                        burnRateField.SetValue(motorObj, newFm / newBt);
+                        burnRateField.SetValue(motorObj, fm / newBt);
                     }
                 }
 
@@ -1253,6 +1251,18 @@ namespace MDSFramework.Missiles
             }
 
             lastDatalinkRefresh = Time.time;
+
+            FactionHQ? hq = Missile.NetworkHQ ?? Missile.MapHQ;
+            if (hq == null || !hq.IsTargetBeingTracked(TargetUnit))
+            {
+                return;
+            }
+
+            if (!hq.TryGetKnownPosition(TargetUnit, out GlobalPosition hqKnownPos))
+            {
+                return;
+            }
+
             if (Missile.targetID.NotValid)
             {
                 Missile.SetTarget(TargetUnit);
@@ -1265,7 +1275,7 @@ namespace MDSFramework.Missiles
                 {
                     Vector3 vel = TargetUnit.rb != null ? TargetUnit.rb.velocity : Vector3.zero;
                     GameInteropHelpers.SeekerTargetUnitField?.SetValue(arh, TargetUnit);
-                    GameInteropHelpers.ArhKnownPosField?.SetValue(arh, GameInteropHelpers.WorldToGlobal(TargetUnit.transform.position));
+                    GameInteropHelpers.ArhKnownPosField?.SetValue(arh, hqKnownPos);
                     GameInteropHelpers.ArhKnownVelField?.SetValue(arh, vel);
                 }
             }
@@ -1569,13 +1579,12 @@ namespace MDSFramework.Missiles
                 return false;
             }
 
-            if (u is Aircraft ac && ac.GetECMIntensity() > 0.05f)
+            if (SensorNetworkManager.Instance != null)
             {
-                return true;
+                return SensorNetworkManager.Instance.IsUnitActivelyEmittingEcm(u, 3.5f);
             }
 
-            return SensorNetworkManager.Instance != null &&
-                   SensorNetworkManager.Instance.HasFreshDirectJamEvent(u, 3.5f);
+            return u is Aircraft ac && ac.GetECMIntensity() > 0.05f;
         }
 
         private bool TryGetFriendlyHojTrack(Unit target, out HojTrackEntry matched)
@@ -3302,11 +3311,30 @@ namespace MDSFramework.Missiles
 
             interceptedTarget = true;
             float altAboveSea = currTargetPos.y - Datum.LocalSeaY;
-            if (Spec.DisarmTargetWarheadOnIntercept)
+            float groundY = Mathf.Max(Datum.LocalSeaY, SampleTerrainY(currTargetPos.x, currTargetPos.z, Datum.LocalSeaY));
+            float agl = currTargetPos.y - groundY;
+            float minDisarmAgl = Mathf.Max(250f, Spec.HighAltitudeInterceptMinMeters);
+            if (Spec.DisarmTargetWarheadOnIntercept && agl >= minDisarmAgl)
             {
                 bool disarmed = GameInteropHelpers.SafeDisarmWarhead(targetMissile);
+                if (disarmed)
+                {
+                    float curYield = GameInteropHelpers.SafeGetBlastYield(targetMissile);
+                    if (curYield <= 200f && GameInteropHelpers.MissileBlastYieldField != null)
+                    {
+                        try
+                        {
+                            GameInteropHelpers.MissileBlastYieldField.SetValue(targetMissile, 0f);
+                        }
+                        catch
+                        {
+                            // ignored
+                        }
+                    }
+                }
+
                 MdsLog.Info(
-                    $"[ABM] '{Spec.DisplayName}' intercepted '{targetMissile.unitName}' at {altAboveSea:0} m " +
+                    $"[ABM] '{Spec.DisplayName}' intercepted '{targetMissile.unitName}' at {altAboveSea:0} m MSL ({agl:0} m AGL) " +
                     $"(warheadArmed={!disarmed}).");
             }
 

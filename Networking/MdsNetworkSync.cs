@@ -84,6 +84,7 @@ namespace MDSFramework.Networking
         private static readonly Dictionary<string, FactionAffinity> RemotePackageFactions = new Dictionary<string, FactionAffinity>(StringComparer.OrdinalIgnoreCase);
 
         private static string[]? pendingHelloArgs;
+        private static bool hostAckedHi;
         private static float nextHelloAt;
         private static float nextSiteSyncAt;
         private static float nextFullSiteSyncAt;
@@ -178,6 +179,7 @@ namespace MDSFramework.Networking
             PendingClientContainerLandings.Clear();
             PendingClientMissileIgnitions.Clear();
             pendingHelloArgs = null;
+            hostAckedHi = false;
             lastAbmWarnDigest = string.Empty;
             nextHelloAt = 0f;
             nextSiteSyncAt = 0f;
@@ -225,6 +227,7 @@ namespace MDSFramework.Networking
                 {
                     RestoreLocalPackageFactions();
                     HostHasMds = false;
+                    hostAckedHi = false;
                     CatalogMismatchWarning = null;
                 }
             }
@@ -870,6 +873,7 @@ namespace MDSFramework.Networking
                     MdsLog.Info($"[Net] Guest {sender} verified MDS sync ({WireProtocolVersion}). Sending initial state.");
                 }
 
+                SendToPlayer(sender, Join("hi_ack", WireProtocolVersion));
                 FlushSiteSync(forceFull: true, targetPlayer: sender);
                 BroadcastAbmWarningsIfChanged(force: true, targetPlayer: sender);
                 ReplayLateJoinEventsToPlayer(sender);
@@ -933,6 +937,12 @@ namespace MDSFramework.Networking
                 return;
             }
 
+            if (verb == "hi_ack")
+            {
+                hostAckedHi = true;
+                return;
+            }
+
             if (!HostHasMds)
             {
                 return;
@@ -980,6 +990,7 @@ namespace MDSFramework.Networking
                 }
 
                 HostHasMds = false;
+                hostAckedHi = false;
                 RemotePackageFactions.Clear();
                 RemoteEnableNativeAircraftAirdrop = true;
                 RemoteEnableMissionEditorCatalog = true;
@@ -1010,7 +1021,7 @@ namespace MDSFramework.Networking
 
             bool firstHandshake = !HostHasMds;
             HostHasMds = true;
-            if (firstHandshake)
+            if (firstHandshake || !hostAckedHi)
             {
                 MdsLog.Info($"[Net] Connected to MDS host ({hostProto}, hash={hostCatalogHash:x8}). Sending 'hi'.");
                 SendToHost(Join("hi", WireProtocolVersion, MdsCatalogCoordinator.CatalogWireHash.ToString(CultureInfo.InvariantCulture)));

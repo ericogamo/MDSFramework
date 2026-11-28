@@ -479,7 +479,10 @@ namespace MDSFramework.Deployment
 
             if (Spec?.Logistics != null)
             {
-                RtsBridgeHost.Current.Caps.ReleaseCap(Faction, Spec.Logistics.CapCategory, Spec.Logistics.CapWeight);
+                using (RtsBridgeHost.EnterHqScope(Hq))
+                {
+                    RtsBridgeHost.Current.Caps.ReleaseCap(Faction, Spec.Logistics.CapCategory, Spec.Logistics.CapWeight);
+                }
             }
         }
     }

@@ -364,9 +364,43 @@ namespace MDSFramework.Assets3D
             ApplyTurretRotations();
         }
 
+        internal bool IsAimedAtWorldPosition(Vector3 worldPos)
+        {
+            if (animator != null && !animator.IsFullyDeployed)
+            {
+                return false;
+            }
+
+            if (rig == null || rig.TurretBase == null)
+            {
+                return true;
+            }
+
+            Transform pivot = rig.TurretHead != null ? rig.TurretHead : rig.TurretBase;
+            Vector3 worldDir = worldPos - pivot.position;
+            if (worldDir.sqrMagnitude < 0.01f)
+            {
+                return true;
+            }
+
+            Transform baseParent = rig.TurretBase.parent != null ? rig.TurretBase.parent : rig.RootObject.transform;
+            Vector3 localDir = baseParent.InverseTransformDirection(worldDir.normalized);
+            float desiredYaw = Mathf.Atan2(localDir.x, localDir.z) * Mathf.Rad2Deg;
+            float horizMag = Mathf.Sqrt(localDir.x * localDir.x + localDir.z * localDir.z);
+            float desiredPitch = Mathf.Atan2(localDir.y, Mathf.Max(0.0001f, horizMag)) * Mathf.Rad2Deg;
+            float clampedPitch = Mathf.Clamp(desiredPitch, minElevationDeg, maxElevationDeg);
+
+            float refPitch = minElevationDeg >= 15f
+                ? clampedPitch
+                : desiredPitch;
+            float aimYawErr = Mathf.Abs(Mathf.DeltaAngle(currentYawDeg, desiredYaw));
+            float aimPitchErr = Mathf.Abs(currentPitchDeg - refPitch);
+            return aimYawErr <= 3.5f && aimPitchErr <= 3.5f;
+        }
+
         private bool IsWithinAimTolerance()
         {
-            float refPitch = (minElevationDeg >= 15f && desiredUnclampedPitchDeg >= -20f)
+            float refPitch = minElevationDeg >= 15f
                 ? targetPitchDeg
                 : desiredUnclampedPitchDeg;
             float aimYawErr = Mathf.Abs(Mathf.DeltaAngle(currentYawDeg, targetYawDeg));

@@ -9,6 +9,7 @@ using MDSFramework.Missiles;
 using MDSFramework.Networking;
 using Mirage;
 using NuclearOption.Networking;
+using NuclearOption.SavedMission;
 using UnityEngine;
 
 namespace MDSFramework.Patches
@@ -318,11 +319,21 @@ namespace MDSFramework.Patches
             FactionHQ? hq = container.NetworkHQ ?? container.MapHQ ?? (owner != null ? owner.NetworkHQ ?? owner.MapHQ : null);
             FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(hq);
 
-            bool consumedCap = entry.Spec.Logistics == null ||
-                               RtsBridgeHost.Current.Caps.TryConsumeCap(
-                                   faction,
-                                   entry.Spec.Logistics.CapCategory,
-                                   entry.Spec.Logistics.CapWeight);
+            if (AirdropDetachmentScope.IsActive)
+            {
+                MdsLog.Debug($"[Airdrop] Ignoring detached cargo spawn for '{entry.Spec.UnitId}' during part detachment.");
+                return;
+            }
+
+            bool consumedCap;
+            using (RtsBridgeHost.EnterHqScope(hq))
+            {
+                consumedCap = entry.Spec.Logistics == null ||
+                              RtsBridgeHost.Current.Caps.TryConsumeCap(
+                                  faction,
+                                  entry.Spec.Logistics.CapCategory,
+                                  entry.Spec.Logistics.CapWeight);
+            }
             if (!consumedCap)
             {
                 float refunded = 0f;
@@ -460,24 +471,157 @@ namespace MDSFramework.Patches
             }
 
             FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(hq);
-            if (!RtsBridgeHost.Current.Economy.IsPackageAllowedForFaction(entry.Package, faction))
+            using (RtsBridgeHost.EnterHqScope(hq))
             {
-                __result = false;
-                return;
-            }
-
-            if (entry.Spec.Logistics != null)
-            {
-                int tier = RtsBridgeHost.Current.Economy.QueryFactionTechTier(faction);
-                if (tier < entry.Spec.Logistics.RequiredTechTier)
+                if (!RtsBridgeHost.Current.Economy.IsPackageAllowedForFaction(entry.Package, faction))
                 {
                     __result = false;
                     return;
                 }
 
-                if (!RtsBridgeHost.Current.Caps.CanConsumeCap(faction, entry.Spec.Logistics.CapCategory, entry.Spec.Logistics.CapWeight, out _))
+                if (entry.Spec.Logistics != null)
                 {
-                    __result = false;
+                    int tier = RtsBridgeHost.Current.Economy.QueryFactionTechTier(faction);
+                    if (tier < entry.Spec.Logistics.RequiredTechTier)
+                    {
+                        __result = false;
+                        return;
+                    }
+
+                    if (!RtsBridgeHost.Current.Caps.CanConsumeCap(faction, entry.Spec.Logistics.CapCategory, entry.Spec.Logistics.CapWeight, out _))
+                    {
+                        __result = false;
+                    }
+                }
+            }
+        }
+    }
+
+    internal static class AirdropDetachmentScope
+    {
+        [ThreadStatic]
+        private static int depth;
+
+        internal static bool IsActive => depth > 0;
+
+        internal static void Enter() => depth++;
+
+        internal static void Exit()
+        {
+            if (depth > 0)
+            {
+                depth--;
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(MountedCargo), "MountedCargo_OnPartDetached", new[] { typeof(UnitPart) })]
+    internal static class MountedCargoPartDetachedScopePatch
+    {
+        private static void Prefix() => AirdropDetachmentScope.Enter();
+        private static void Finalizer() => AirdropDetachmentScope.Exit();
+    }
+
+    [HarmonyPatch(typeof(WeaponManager), "StationExistsForWeaponInfo", new[] { typeof(WeaponInfo), typeof(bool), typeof(WeaponStation) }, new[] { ArgumentType.Normal, ArgumentType.Normal, ArgumentType.Out })]
+    internal static class WeaponManagerSeparateCargoStationsPatch
+    {
+        private static readonly FieldInfo? WeaponManagerAircraftField = AccessTools.Field(typeof(WeaponManager), "aircraft");
+
+        private static bool Prefix(WeaponManager __instance, WeaponInfo? weaponInfo, bool cargo, out WeaponStation? existingStation, ref bool __result)
+        {
+            existingStation = null;
+            if (!cargo || weaponInfo == null || __instance == null)
+            {
+                return true;
+            }
+
+            Aircraft? aircraft = WeaponManagerAircraftField?.GetValue(__instance) as Aircraft;
+            if (aircraft == null || aircraft.weaponStations == null)
+            {
+                return true;
+            }
+
+            List<WeaponStation> stations = aircraft.weaponStations;
+            for (int i = 0; i < stations.Count; i++)
+            {
+                WeaponStation? station = stations[i];
+                if (station != null && station.Cargo && ReferenceEquals(station.WeaponInfo, weaponInfo))
+                {
+                    existingStation = station;
+                    __result = true;
+                    return false;
+                }
+            }
+
+            __result = false;
+            return false;
+        }
+    }
+
+    [HarmonyPatch(typeof(WeaponChecker), nameof(WeaponChecker.VetLoadout), new[] { typeof(AircraftDefinition), typeof(Loadout), typeof(Player), typeof(Airbase), typeof(INetworkPlayer) })]
+    internal static class WeaponCheckerVetLoadoutCapPatch
+    {
+        private static void Postfix(AircraftDefinition? definition, Loadout? requestedLoadout, Airbase? airbase, INetworkPlayer? sender)
+        {
+            if (!MdsNetworkSync.GetEffectiveEnableNativeAircraftAirdrop() ||
+                definition == null ||
+                definition.unitPrefab == null ||
+                requestedLoadout == null ||
+                requestedLoadout.weapons == null ||
+                airbase == null)
+            {
+                return;
+            }
+
+            FactionHQ? hq = airbase.CurrentHQ;
+            if (hq == null)
+            {
+                return;
+            }
+
+            Aircraft? acPrefab = definition.unitPrefab.GetComponent<Aircraft>();
+            WeaponManager? wm = acPrefab != null ? acPrefab.weaponManager : null;
+            if (wm == null || wm.hardpointSets == null)
+            {
+                return;
+            }
+
+            FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(hq);
+            var cumulativeByCategory = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            int limit = Math.Min(requestedLoadout.weapons.Count, wm.hardpointSets.Length);
+
+            using (RtsBridgeHost.EnterHqScope(hq))
+            {
+                for (int i = 0; i < limit; i++)
+                {
+                    WeaponMount? mount = requestedLoadout.weapons[i];
+                    if (mount == null || !AirdropCatalogManager.TryResolveMount(mount, out AirdropCatalogEntry entry))
+                    {
+                        continue;
+                    }
+
+                    if (entry.Spec.Logistics == null || entry.Spec.Logistics.CapWeight <= 0)
+                    {
+                        continue;
+                    }
+
+                    int hpCount = wm.hardpointSets[i]?.hardpoints != null
+                        ? Math.Max(1, wm.hardpointSets[i].hardpoints.Count)
+                        : 1;
+                    int addedWeight = entry.Spec.Logistics.CapWeight * hpCount;
+                    string cat = string.IsNullOrEmpty(entry.Spec.Logistics.CapCategory) ? "Ground" : entry.Spec.Logistics.CapCategory;
+                    cumulativeByCategory.TryGetValue(cat, out int priorWeight);
+                    int nextTotal = priorWeight + addedWeight;
+
+                    if (!RtsBridgeHost.Current.Caps.CanConsumeCap(faction, cat, nextTotal, out _))
+                    {
+                        requestedLoadout.weapons[i] = null;
+                        sender?.SetError(1, NuclearOptionPlayerErrorFlags.InvalidLoadout);
+                    }
+                    else
+                    {
+                        cumulativeByCategory[cat] = nextTotal;
+                    }
                 }
             }
         }

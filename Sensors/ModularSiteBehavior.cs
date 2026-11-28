@@ -551,10 +551,8 @@ namespace MDSFramework.Sensors
 
             LastJamTime = Time.time;
             LastJammerUnit = jammerUnit;
-            float baseTol = Spec.SensorProfile != null ? Mathf.Clamp01(Spec.SensorProfile.JamTolerance) : 0.5f;
-            float tol = Mathf.Clamp(baseTol + EffectiveNetworkEccmBonus, 0f, 0.92f);
-            float effectiveIncrease = jamAmount * (1f - (tol * 0.65f));
-            CurrentJamLevel = Mathf.Clamp01(Mathf.Max(CurrentJamLevel, effectiveIncrease));
+            // Store raw accumulated jamming here; SensorBandPhysics applies JamTolerance + network ECCM once.
+            CurrentJamLevel = Mathf.Clamp01(Mathf.Max(CurrentJamLevel, jamAmount) + (jamAmount * 0.35f));
         }
 
         internal UnitPart? GetPrimaryUnitPart()
@@ -710,10 +708,15 @@ namespace MDSFramework.Sensors
             if (initiallyConsumedRtsCap &&
                 !ConsumedRtsCap &&
                 Spec?.Logistics != null &&
-                GameInteropHelpers.IsServerAuthority() &&
-                RtsBridgeHost.Current.Caps.TryConsumeCap(Faction, Spec.Logistics.CapCategory, Spec.Logistics.CapWeight))
+                GameInteropHelpers.IsServerAuthority())
             {
-                ConsumedRtsCap = true;
+                using (RtsBridgeHost.EnterHqScope(Hq ?? Unit.NetworkHQ ?? Unit.MapHQ))
+                {
+                    if (RtsBridgeHost.Current.Caps.TryConsumeCap(Faction, Spec.Logistics.CapCategory, Spec.Logistics.CapWeight))
+                    {
+                        ConsumedRtsCap = true;
+                    }
+                }
             }
 
             RestoreNativeSensorOnRepair();

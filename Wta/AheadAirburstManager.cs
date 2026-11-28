@@ -558,21 +558,60 @@ namespace MDSFramework.Wta
             }
 
             bool temporarilyDisarmed = false;
+            bool permanentlyDisarmedNuclear = false;
+            float originalYield = 0f;
+            bool clearedSubThresholdYield = false;
+
             if (target is Missile m && m.IsArmed())
             {
-                bool shouldDisarm = MdsConfig.EnableHighAltitudeDisarm.Value ||
-                                    GameInteropHelpers.SafeGetBlastYield(m) < MdsConfig.AbmBlastYieldThreshold.Value;
-                if (shouldDisarm)
+                originalYield = GameInteropHelpers.SafeGetBlastYield(m);
+                bool isNuclearYield = originalYield >= MdsConfig.AbmBlastYieldThreshold.Value;
+                if (isNuclearYield)
+                {
+                    if (MdsConfig.EnableHighAltitudeDisarm.Value &&
+                        SmartEngagementEngine.ComputeTerrainRelativeAglMeters(m.transform.position) >= 250f)
+                    {
+                        permanentlyDisarmedNuclear = GameInteropHelpers.SafeDisarmWarhead(m);
+                    }
+                }
+                else
                 {
                     temporarilyDisarmed = GameInteropHelpers.SafeDisarmWarhead(m);
+                    if (temporarilyDisarmed && originalYield <= 200f && GameInteropHelpers.MissileBlastYieldField != null)
+                    {
+                        try
+                        {
+                            GameInteropHelpers.MissileBlastYieldField.SetValue(m, 0f);
+                            clearedSubThresholdYield = true;
+                        }
+                        catch
+                        {
+                            // ignored
+                        }
+                    }
                 }
             }
 
             SmartEngagementEngine.ApplyThermalOrKineticDamage(attacker, target, damage, isFire: false);
 
-            if (temporarilyDisarmed && target is Missile mAfter && !mAfter.disabled)
+            if (target is Missile mAfter && !mAfter.disabled)
             {
-                mAfter.Arm();
+                if (clearedSubThresholdYield && GameInteropHelpers.MissileBlastYieldField != null)
+                {
+                    try
+                    {
+                        GameInteropHelpers.MissileBlastYieldField.SetValue(mAfter, originalYield);
+                    }
+                    catch
+                    {
+                        // ignored
+                    }
+                }
+
+                if (temporarilyDisarmed && !permanentlyDisarmedNuclear)
+                {
+                    mAfter.Arm();
+                }
             }
         }
 

@@ -149,18 +149,6 @@ namespace MDSFramework.Sensors
                 }
             }
 
-            // Guarantee EO/IR backup if configured even if not explicitly repeated in SupportedBands.
-            if (profile.EoIrEmergencyRangeKm > 0.1f)
-            {
-                float eoirRange = profile.EoIrEmergencyRangeKm * 1000f;
-                if (eoirRange > bestRange)
-                {
-                    bestRange = eoirRange;
-                    bestBand = SensorBand.EoIr;
-                    trackQuality = 0.88f;
-                }
-            }
-
             return bestRange;
         }
     }

@@ -130,6 +130,11 @@ namespace MDSFramework.Wta
                     continue;
                 }
 
+                if (site.HasPendingManualFire)
+                {
+                    continue;
+                }
+
                 profile ??= site.Package?.DefaultWtaProfile;
 
                 if (site.Spec.Role == WeaponCascadeRole.FireControl ||
@@ -617,6 +622,18 @@ namespace MDSFramework.Wta
             return false;
         }
 
+        internal static float ComputeTerrainRelativeAglMeters(Vector3 worldPos)
+        {
+            float groundY = Datum.LocalSeaY;
+            Vector3 probeOrigin = new Vector3(worldPos.x, worldPos.y + 5f, worldPos.z);
+            if (Physics.Raycast(probeOrigin, Vector3.down, out RaycastHit hit, 12000f, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
+            {
+                groundY = Mathf.Max(groundY, hit.point.y);
+            }
+
+            return worldPos.y - groundY;
+        }
+
         private static bool IsWithinAnyAntiShipOrFriendlySensor(Ship ship, IReadOnlyList<ModularSiteBehavior> allSites, FactionAffinity faction)
         {
             if (IsWithinAnyFriendlySiteSensor(ship, allSites, faction))
@@ -624,19 +641,31 @@ namespace MDSFramework.Wta
                 return true;
             }
 
-            Vector3 shipPos = ship.transform.position;
+            Vector3 shipPos = GetTargetAimPosition(ship);
             for (int i = 0; i < allSites.Count; i++)
             {
                 ModularSiteBehavior site = allSites[i];
-                if (!site.IsAlive || site.SuspendedInTransit || site.Faction != faction || site.Unit == null)
+                if (!site.IsAlive ||
+                    site.SuspendedInTransit ||
+                    !site.IsDeployed ||
+                    site.Faction != faction ||
+                    site.Unit == null ||
+                    site.Spec.SensorProfile == null)
                 {
                     continue;
                 }
 
                 if (site.Spec.Role == WeaponCascadeRole.AntiShipCoastal && site.AmmoRemaining > 0)
                 {
-                    float maxSq = Mathf.Pow(Mathf.Max(1000f, site.Spec.MaxEngagementRangeKm * 1000f), 2f);
-                    if ((site.Unit.transform.position - shipPos).sqrMagnitude <= maxSq)
+                    float sensorRangeKm = site.HasFireControlGuidance || site.IsRadarEmitting
+                        ? site.Spec.SensorProfile.DetectionRangeKm
+                        : site.Spec.SensorProfile.EoIrEmergencyRangeKm;
+                    float effectiveRangeM = Mathf.Min(
+                        Mathf.Max(1000f, site.Spec.MaxEngagementRangeKm * 1000f),
+                        Mathf.Max(0f, sensorRangeKm * 1000f));
+                    if (effectiveRangeM > 100f &&
+                        (site.Unit.transform.position - shipPos).sqrMagnitude <= effectiveRangeM * effectiveRangeM &&
+                        !Physics.Linecast(GetMuzzleOrigin(site), shipPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                     {
                         return true;
                     }
@@ -814,7 +843,7 @@ namespace MDSFramework.Wta
             }
 
             bool isEmittingRadar = target.HasRadarEmission();
-            bool isJammer = forceJammer || isActivelyJamming || target.GetComponentInChildren<JammingPod>(true) != null;
+            bool isJammer = forceJammer || isActivelyJamming;
 
             float shipSizeMetric = isShip
                 ? (target.definition != null
@@ -1147,7 +1176,9 @@ namespace MDSFramework.Wta
                 }
                 else
                 {
-                    float siteWatchRangeM = Mathf.Min(popUpRangeM, Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1250f));
+                    float siteWatchRangeM = site.Spec.MaxEngagementRangeKm > profile.AutoPopUpRangeKm
+                        ? Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1080f)
+                        : Mathf.Min(popUpRangeM, Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1250f));
                     float siteWatchSq = siteWatchRangeM * siteWatchRangeM;
                     float groundWatchSq = Mathf.Pow(Mathf.Max(1500f, site.Spec.MaxEngagementRangeKm * 1250f), 2f);
                     for (int t = 0; t < threatCount; t++)
@@ -1470,7 +1501,7 @@ namespace MDSFramework.Wta
                         {
                             bestScore = score;
                             bestThreatIdx = t;
-                            bestPassiveHoj = th.IsJammer || th.IsActivelyJamming;
+                            bestPassiveHoj = th.IsActivelyJamming;
                             bestIsHojMissile = slotIsHojMissile;
                             bestUseSecondary = slotUseSecondary;
                         }
@@ -1497,18 +1528,24 @@ namespace MDSFramework.Wta
                         _ => WtaEngagementKind.CustomMissile
                     };
 
+                    if ((kind == WtaEngagementKind.CustomMissile ||
+                         kind == WtaEngagementKind.AbmVls ||
+                         kind == WtaEngagementKind.LaserHel ||
+                         kind == WtaEngagementKind.GunCiws) &&
+                        !site.Spec.VerticalLaunch &&
+                        !site.Spec.LaunchAlongSocketForward &&
+                        site.TurretAim != null)
+                    {
+                        site.TurretAim.SetAimWorldPosition(threatBuffer[bestThreatIdx].WorldPos);
+                        aimedThisTick[e] = true;
+                        if (!site.TurretAim.IsOnTarget)
+                        {
+                            continue;
+                        }
+                    }
+
                     if (kind == WtaEngagementKind.CustomMissile || kind == WtaEngagementKind.AbmVls)
                     {
-                        if (!site.Spec.VerticalLaunch && !site.Spec.LaunchAlongSocketForward && site.TurretAim != null)
-                        {
-                            site.TurretAim.SetAimWorldPosition(threatBuffer[bestThreatIdx].WorldPos);
-                            aimedThisTick[e] = true;
-                            if (!site.TurretAim.IsOnTarget)
-                            {
-                                continue;
-                            }
-                        }
-
                         ThreatSnapshot updated = threatBuffer[bestThreatIdx];
                         updated.AssignedThisTick++;
                         if (bestIsHojMissile)
@@ -1810,6 +1847,8 @@ namespace MDSFramework.Wta
                 int bestThreatIdx = -1;
                 float bestScore = float.MinValue;
                 bool bestUseSecondary = false;
+                bool checkLos = site.Spec.LaunchAlongSocketForward || site.EmconState == FcuEmconState.EoIrEmergencyOnly;
+                Vector3 muzzlePos = checkLos ? GetMuzzleOrigin(site) : Vector3.zero;
                 for (int t = 0; t < threatCount; t++)
                 {
                     ThreatSnapshot th = threatBuffer[t];
@@ -1828,6 +1867,12 @@ namespace MDSFramework.Wta
                     float distSq = (th.WorldPos - eff.WorldPos).sqrMagnitude;
                     if (distSq < eff.MinRangeMeters * eff.MinRangeMeters ||
                         distSq > eff.MaxRangeMeters * eff.MaxRangeMeters)
+                    {
+                        continue;
+                    }
+
+                    if (checkLos &&
+                        Physics.Linecast(muzzlePos, th.WorldPos, (int)PhysicsLayers.StaticsMask, QueryTriggerInteraction.Ignore))
                     {
                         continue;
                     }
@@ -1968,8 +2013,17 @@ namespace MDSFramework.Wta
                 {
                     site.TurretAim?.SetAimWorldPosition(threatBuffer[bestThreatIdx].WorldPos);
                     aimedThisTick[e] = true;
-                    effectorAssignedThreatScratch[e] = bestThreatIdx;
                     continue;
+                }
+
+                if (site.TurretAim != null)
+                {
+                    site.TurretAim.SetAimWorldPosition(threatBuffer[bestThreatIdx].WorldPos);
+                    aimedThisTick[e] = true;
+                    if (!site.TurretAim.IsOnTarget)
+                    {
+                        continue;
+                    }
                 }
 
                 effectorUsedThisTick[e] = true;
@@ -2009,6 +2063,9 @@ namespace MDSFramework.Wta
             bool bestUseSecondary = false;
             bool bestIsHojMissile = false;
             WtaEngagementKind bestKind = WtaEngagementKind.CustomMissile;
+
+            int bestSlewE = -1;
+            float bestSlewScore = float.MinValue;
 
             for (int e = 0; e < effectorCount; e++)
             {
@@ -2128,11 +2185,14 @@ namespace MDSFramework.Wta
                 // Balance magazine usage across networked launchers.
                 score += eff.AmmoRatio * 25f;
 
+                bool needsTurretAlignment = !site.Spec.VerticalLaunch && !site.Spec.LaunchAlongSocketForward && site.TurretAim != null;
+                bool isAligned = !needsTurretAlignment || site.TurretAim!.IsAimedAtWorldPosition(th.WorldPos);
+
                 if (site.Spec.VerticalLaunch)
                 {
                     score += 12f;
                 }
-                else if (site.TurretAim != null && site.TurretAim.IsOnTarget)
+                else if (isAligned)
                 {
                     score += 14f;
                 }
@@ -2142,14 +2202,28 @@ namespace MDSFramework.Wta
                     score += 35f;
                 }
 
-                if (score > bestScore)
+                if (isAligned)
                 {
-                    bestScore = score;
-                    bestE = e;
-                    bestUseSecondary = slotUseSecondary;
-                    bestIsHojMissile = slotIsHojMissile;
-                    bestKind = eff.Role == WeaponCascadeRole.AbmVls ? WtaEngagementKind.AbmVls : WtaEngagementKind.CustomMissile;
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestE = e;
+                        bestUseSecondary = slotUseSecondary;
+                        bestIsHojMissile = slotIsHojMissile;
+                        bestKind = eff.Role == WeaponCascadeRole.AbmVls ? WtaEngagementKind.AbmVls : WtaEngagementKind.CustomMissile;
+                    }
                 }
+                else if (!aimedThisTick[e] && score > bestSlewScore)
+                {
+                    bestSlewScore = score;
+                    bestSlewE = e;
+                }
+            }
+
+            if (bestSlewE >= 0 && bestSlewE != bestE && !aimedThisTick[bestSlewE])
+            {
+                effectorSiteBuffer[bestSlewE]?.TurretAim?.SetAimWorldPosition(th.WorldPos);
+                aimedThisTick[bestSlewE] = true;
             }
 
             if (bestE < 0)
@@ -2195,7 +2269,7 @@ namespace MDSFramework.Wta
                 EffectorSiteIndex = effectorBuffer[bestE].SiteIndex,
                 ThreatIndex = threatIdx,
                 Kind = bestKind,
-                UsePassiveHoj = th.IsJammer || th.IsActivelyJamming,
+                UsePassiveHoj = th.IsActivelyJamming,
                 UseSecondaryMissile = bestUseSecondary
             };
         }
@@ -2286,7 +2360,12 @@ namespace MDSFramework.Wta
             float score = 10f;
             if (th.IsBallistic || th.IsNuclear)
             {
-                score += spec.IsAbmInterceptor ? 220f : 40f;
+                if (!spec.IsAbmInterceptor)
+                {
+                    return float.MinValue;
+                }
+
+                score += 220f;
             }
             else if (th.IsActivelyJamming)
             {
@@ -2353,6 +2432,11 @@ namespace MDSFramework.Wta
             switch (role)
             {
                 case WeaponCascadeRole.LaserHel:
+                    if (th.IsBallistic || th.IsNuclear)
+                    {
+                        return false;
+                    }
+
                     return th.IsMissile || th.AltitudeMeters < 4500f;
 
                 case WeaponCascadeRole.CloseInGun:
@@ -2374,7 +2458,7 @@ namespace MDSFramework.Wta
                     return th.IsBallistic || th.IsNuclear || th.IsAircraft || th.IsJammer || th.IsMissile;
 
                 case WeaponCascadeRole.ShortMedSam:
-                    if (th.IsDecoy)
+                    if (th.IsDecoy || th.IsBallistic || th.IsNuclear)
                     {
                         return false;
                     }
@@ -2394,7 +2478,7 @@ namespace MDSFramework.Wta
                     return true;
 
                 case WeaponCascadeRole.LongRangeSam:
-                    if (th.IsDecoy || th.IsShellOrSmallMunition || th.IsArtilleryShell)
+                    if (th.IsDecoy || th.IsBallistic || th.IsNuclear || th.IsShellOrSmallMunition || th.IsArtilleryShell)
                     {
                         return false;
                     }
@@ -2706,9 +2790,26 @@ namespace MDSFramework.Wta
 
             if (target is Missile targetMissile)
             {
-                if (targetMissile.IsArmed() && (MdsConfig.EnableHighAltitudeDisarm.Value || !th.IsNuclear))
+                if (targetMissile.IsArmed())
                 {
-                    GameInteropHelpers.SafeDisarmWarhead(targetMissile);
+                    bool shouldDisarm = th.IsNuclear
+                        ? (MdsConfig.EnableHighAltitudeDisarm.Value && ComputeTerrainRelativeAglMeters(targetMissile.transform.position) >= 250f)
+                        : true;
+                    if (shouldDisarm && GameInteropHelpers.SafeDisarmWarhead(targetMissile))
+                    {
+                        float curYield = GameInteropHelpers.SafeGetBlastYield(targetMissile);
+                        if (curYield <= 200f && GameInteropHelpers.MissileBlastYieldField != null)
+                        {
+                            try
+                            {
+                                GameInteropHelpers.MissileBlastYieldField.SetValue(targetMissile, 0f);
+                            }
+                            catch
+                            {
+                                // ignored
+                            }
+                        }
+                    }
                 }
 
                 float lethalThermal = Mathf.Max(2500f, GameInteropHelpers.SafeGetHitpoints(targetMissile) * 10f + 500f);
@@ -2729,7 +2830,7 @@ namespace MDSFramework.Wta
             }
             else
             {
-                ApplyThermalOrKineticDamage(site.Unit, target, 140f, isFire: true);
+                ApplyThermalOrKineticDamage(site.Unit, target, 140f * powerFactor, isFire: true);
             }
         }
 
@@ -2838,9 +2939,12 @@ namespace MDSFramework.Wta
             bool reservedAbm = false;
             if (missileSpec.IsAbmInterceptor)
             {
-                if (!RtsBridgeHost.Current.AbmStockpile.TryReserveAbmInterceptor(site.Faction, missileSpec.MissileId))
+                using (RtsBridgeHost.EnterHqScope(site.Hq))
                 {
-                    return false;
+                    if (!RtsBridgeHost.Current.AbmStockpile.TryReserveAbmInterceptor(site.Faction, missileSpec.MissileId))
+                    {
+                        return false;
+                    }
                 }
 
                 reservedAbm = true;
@@ -2883,13 +2987,16 @@ namespace MDSFramework.Wta
             }
             else if (reservedAbm)
             {
-                if (RtsBridgeHost.RefundAbmInterceptor != null)
+                using (RtsBridgeHost.EnterHqScope(site.Hq))
                 {
-                    RtsBridgeHost.RefundAbmInterceptor.Invoke(site.Faction, missileSpec.MissileId);
-                }
-                else if (RtsBridgeHost.Current.AbmStockpile is VanillaBridgeFallbacks.VanillaAbmStockpileBridge vb)
-                {
-                    vb.RefundAbmInterceptor(site.Faction);
+                    if (RtsBridgeHost.RefundAbmInterceptor != null)
+                    {
+                        RtsBridgeHost.RefundAbmInterceptor.Invoke(site.Faction, missileSpec.MissileId);
+                    }
+                    else if (RtsBridgeHost.Current.AbmStockpile is VanillaBridgeFallbacks.VanillaAbmStockpileBridge vb)
+                    {
+                        vb.RefundAbmInterceptor(site.Faction);
+                    }
                 }
             }
 
@@ -2945,6 +3052,31 @@ namespace MDSFramework.Wta
                     return false;
                 }
 
+                bool isTargetEmittingEcm = SensorNetworkManager.Instance != null &&
+                                           SensorNetworkManager.Instance.IsUnitActivelyEmittingEcm(target);
+
+                if (missileSpec.RequiresTargetEcmToTrack && !isTargetEmittingEcm)
+                {
+                    if (!useSecondarySlot &&
+                        site.SecondaryAmmoRemaining > 0 &&
+                        !string.IsNullOrEmpty(site.Spec.SecondaryMissileId) &&
+                        ContractorRegistry.TryGetMissileSpec(site.Spec.SecondaryMissileId, out _, out CustomMissileSpec secSpec) &&
+                        !secSpec.RequiresTargetEcmToTrack &&
+                        (!secSpec.IsAntiShip || target is Ship) &&
+                        (!secSpec.IsAntiVehicle || target is GroundVehicle))
+                    {
+                        MdsLog.Info($"[Manual FIRE] Target '{target.unitName}' is not emitting ECM; switching '{missileSpec.DisplayName}' -> '{secSpec.DisplayName}'.");
+                        useSecondarySlot = true;
+                        missileId = site.Spec.SecondaryMissileId;
+                        missileSpec = secSpec;
+                    }
+                    else
+                    {
+                        MdsLog.Info($"[Manual FIRE] Rejected '{missileSpec.DisplayName}' -> '{target.unitName}': target is not actively emitting ECM.");
+                        return false;
+                    }
+                }
+
                 float maxRangeM = Mathf.Max(site.Spec.MaxEngagementRangeKm, missileSpec.MaxEngagementRangeKm) * 1000f * 1.05f;
                 Vector3 sitePos = site.Unit != null ? site.Unit.transform.position : site.transform.position;
                 Vector3 targetPos = GetTargetAimPosition(target);
@@ -2953,9 +3085,8 @@ namespace MDSFramework.Wta
                     return false;
                 }
 
-                bool usePassiveHoj = missileSpec.SupportsActiveToPassiveHoj ||
-                                     (SensorNetworkManager.Instance != null &&
-                                      SensorNetworkManager.Instance.IsUnitActivelyEmittingEcm(target));
+                bool usePassiveHoj = missileSpec.RequiresTargetEcmToTrack ||
+                                     (missileSpec.SupportsActiveToPassiveHoj && isTargetEmittingEcm);
 
                 if (!site.Spec.VerticalLaunch && !site.Spec.LaunchAlongSocketForward && site.TurretAim != null)
                 {

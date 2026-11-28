@@ -50,14 +50,52 @@ namespace MDSFramework.Api
     {
         private static readonly DefaultBridgeHost Host = new DefaultBridgeHost();
 
+        [ThreadStatic]
+        private static FactionHQ? scopedHq;
+
         public static bool IsRtsBridgeAttached { get; private set; }
         public static IRtsBridgeHost Current => Host;
+        public static FactionHQ? CurrentScopedHq => scopedHq;
         public static Func<Unit, bool>? QueryUnitHoldFire { get; set; }
         public static Action<FactionAffinity, string>? RefundAbmInterceptor { get; set; }
         public static Func<PersistentID, int>? QueryActiveAbmInterceptorsForThreat { get; set; }
         public static Action<Unit, bool>? SyncMdsSiteHoldFireToRts { get; set; }
 
         public static event Action? OnBridgeChanged;
+
+        public readonly struct HqScope : IDisposable
+        {
+            private readonly FactionHQ? previousHq;
+            private readonly bool active;
+
+            internal HqScope(FactionHQ? hq)
+            {
+                if (hq != null)
+                {
+                    previousHq = scopedHq;
+                    scopedHq = hq;
+                    active = true;
+                }
+                else
+                {
+                    previousHq = null;
+                    active = false;
+                }
+            }
+
+            public void Dispose()
+            {
+                if (active)
+                {
+                    scopedHq = previousHq;
+                }
+            }
+        }
+
+        public static HqScope EnterHqScope(FactionHQ? hq)
+        {
+            return new HqScope(hq);
+        }
 
         public static void Attach(
             IRtsEconomyBridge economy,

@@ -668,16 +668,19 @@ namespace MDSFramework.Patches
                 {
                     FactionHQ? hq = __instance != null ? (__instance.NetworkHQ ?? __instance.MapHQ) : null;
                     FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(hq);
-                    if (!RtsBridgeHost.Current.Caps.CanConsumeCap(
-                            faction,
-                            spec.Logistics.CapCategory,
-                            spec.Logistics.CapWeight,
-                            out _))
+                    using (RtsBridgeHost.EnterHqScope(hq))
                     {
-                        MdsLog.Warn($"[VehicleDepot] Unit cap full for '{spec.UnitId}' ({faction}); blocking depot spawn.");
-                        __result = false;
-                        __state = false;
-                        return false;
+                        if (!RtsBridgeHost.Current.Caps.CanConsumeCap(
+                                faction,
+                                spec.Logistics.CapCategory,
+                                spec.Logistics.CapWeight,
+                                out _))
+                        {
+                            MdsLog.Warn($"[VehicleDepot] Unit cap full for '{spec.UnitId}' ({faction}); blocking depot spawn.");
+                            __result = false;
+                            __state = false;
+                            return false;
+                        }
                     }
                 }
 
@@ -724,15 +727,22 @@ namespace MDSFramework.Patches
                 ctx.UnitSpec != null)
             {
                 bool consumedCap = false;
-                if (GameInteropHelpers.IsGameplayActive() &&
+                // Mobile vehicles (GroundVehicle) are already counted in hq.factionUnits by DynamicCapAndTechService;
+                // only reserve external MDS cap for non-vehicle units so mobile carriers do not double-count cap.
+                if (!ctx.UnitSpec.IsMobileVehicle &&
+                    GameInteropHelpers.IsGameplayActive() &&
                     GameInteropHelpers.IsServerAuthority() &&
                     ctx.UnitSpec.Logistics != null)
                 {
-                    FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(__result.NetworkHQ ?? __result.MapHQ);
-                    consumedCap = RtsBridgeHost.Current.Caps.TryConsumeCap(
-                        faction,
-                        ctx.UnitSpec.Logistics.CapCategory,
-                        ctx.UnitSpec.Logistics.CapWeight);
+                    FactionHQ? hq = __result.NetworkHQ ?? __result.MapHQ;
+                    FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(hq);
+                    using (RtsBridgeHost.EnterHqScope(hq))
+                    {
+                        consumedCap = RtsBridgeHost.Current.Caps.TryConsumeCap(
+                            faction,
+                            ctx.UnitSpec.Logistics.CapCategory,
+                            ctx.UnitSpec.Logistics.CapWeight);
+                    }
                 }
 
                 MissionEditorPatchHelpers.ActivateMdsUnitOrPreview(

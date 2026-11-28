@@ -425,9 +425,12 @@ namespace MDSFramework.Patches
             }
 
             FactionAffinity faction = GameInteropHelpers.ToFactionAffinity(hq);
-            if (!RtsBridgeHost.Current.Economy.IsPackageAllowedForFaction(entry.Package, faction))
+            using (RtsBridgeHost.EnterHqScope(hq))
             {
-                __result = false;
+                if (!RtsBridgeHost.Current.Economy.IsPackageAllowedForFaction(entry.Package, faction))
+                {
+                    __result = false;
+                }
             }
         }
     }
